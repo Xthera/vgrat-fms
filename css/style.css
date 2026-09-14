@@ -778,22 +778,26 @@ body {
     white-space: nowrap;
 }
 
-.risk-badge.risk-lower-risk {
+/* Tier 0 = "Lower Risk", 1 = "Low/Lower to Medium Risk", 2 = "Medium to
+   High Risk", 3 = "Higher Risk" - assigned by keyword in JS (riskTier()),
+   not by exact string match, since Prudential's own wording for these
+   isn't perfectly consistent across fund pages. */
+.risk-badge.risk-tier-0 {
     background: var(--gain-bg);
     color: var(--gain);
 }
 
-.risk-badge.risk-lower-to-medium-risk {
+.risk-badge.risk-tier-1 {
     background: rgba(14, 165, 233, 0.1);
     color: var(--info);
 }
 
-.risk-badge.risk-medium-to-high-risk {
+.risk-badge.risk-tier-2 {
     background: rgba(245, 158, 11, 0.1);
     color: var(--warning);
 }
 
-.risk-badge.risk-higher-risk {
+.risk-badge.risk-tier-3 {
     background: var(--loss-bg);
     color: var(--loss);
 }
@@ -932,6 +936,25 @@ body {
 
 .news-modal-report p:last-child {
     margin-bottom: 0;
+}
+
+.news-modal-readmore {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 18px;
+    padding: 10px 16px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    text-decoration: none;
+    transition: background 0.15s ease;
+}
+
+.news-modal-readmore:hover {
+    background: var(--accent-hover);
 }
 
 .news-modal-source {
