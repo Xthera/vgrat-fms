@@ -159,7 +159,7 @@ function openFundModal(fundName) {
 
     document.getElementById('modalFundName').textContent = fund.name;
     document.getElementById('modalFundMeta').textContent =
-        `${fund.category} | ${fund.currency} | Effective: ${fund.effective_date}`;
+        `${fund.category} | ${fund.currency} | Inception: ${fund.effective_date}`;
 
     // Calculate returns from history
     const history = fundHistory[fund.name] || [];
@@ -228,7 +228,14 @@ function openNewsModal(index) {
     const n = sortedNews[index];
     if (!n) return;
 
-    const bodyParagraphs = (n.body || []).map(p => `<p>${p}</p>`).join('');
+    // Real scraped articles have a real url + source (from the RSS feed);
+    // the dashboard doesn't reproduce full article text - only the
+    // headline - so this links out to the original publisher instead of
+    // faking a report body.
+    const hasRealLink = !!n.url;
+    const sourceLine = n.source
+        ? `Source: ${n.source}`
+        : 'Source: VGrat Market Intelligence Wire';
 
     document.getElementById('modalNewsTitle').textContent = n.title;
     document.getElementById('modalNewsMeta').textContent = n.date;
@@ -237,8 +244,11 @@ function openNewsModal(index) {
             <span class="timeline-category">${n.category}</span>
             <span class="timeline-impact ${n.impact}">${n.impact} Impact</span>
         </div>
-        <div class="news-modal-report">${bodyParagraphs}</div>
-        <div class="news-modal-source">Source: ${n.source || 'VGrat Market Intelligence Wire'}</div>
+        ${hasRealLink
+            ? `<a class="news-modal-readmore" href="${n.url}" target="_blank" rel="noopener noreferrer">Read full article on ${n.source} &rarr;</a>`
+            : `<div class="news-modal-report"><p>${n.title}</p></div>`
+        }
+        <div class="news-modal-source">${sourceLine}</div>
     `;
     document.getElementById('newsModal').classList.add('active');
 }
@@ -435,9 +445,14 @@ function getVerifiedFunds() {
 }
 
 function renderFundTable() {
-    const returns = calculateReturns('3M');
+    // The daily 'history' series only spans ~90 days total, so a genuine
+    // 6-month figure has to come from the weekly long-range series
+    // (fundHistoryFull) instead - same data source the 1Y-10Y chart
+    // periods already use.
     const returnMap = {};
-    returns.forEach(r => returnMap[r.name] = r.return);
+    allFunds.forEach(f => {
+        returnMap[f.name] = calculatePeriodReturn(f.name, '6M');
+    });
 
     let funds = getVerifiedFunds().map(f => ({ ...f, change: returnMap[f.name] || 0 }));
 
@@ -469,14 +484,15 @@ function renderFundTable() {
     const html = funds.map(f => {
         const changeCls = f.change > 0.01 ? 'up' : f.change < -0.01 ? 'down' : 'flat';
         const arrow = f.change > 0.01 ? '&#9650;' : f.change < -0.01 ? '&#9660;' : '&#9644;';
-        const riskCls = (f.riskCategory || '').toLowerCase().replace(/\s+/g, '-');
+        const riskClsTier = riskTier(f.riskCategory);
+        const riskCls = riskClsTier >= 0 ? RISK_TIER_CLASSES[riskClsTier] : '';
         return `<tr onclick="openFundModal('${escapeName(f.name)}')">
             <td>
                 <span class="fund-name-cell">${f.name}</span>
                 <span class="fund-code-cell">${f.codeVerified === false ? '' : (f.code || '')}</span>
             </td>
             <td><span class="category-badge">${f.category}</span></td>
-            <td><span class="risk-badge risk-${riskCls}">${f.riskCategory || ''}</span></td>
+            <td><span class="risk-badge ${riskCls}">${f.riskCategory || ''}</span></td>
             <td class="num">${f.bid.toFixed(5)}</td>
             <td class="num">${f.offer.toFixed(5)}</td>
             <td>${f.currency}</td>
@@ -512,12 +528,25 @@ function filterCategory(cat) {
 }
 
 // ==================== RISK FILTERS ====================
-const RISK_ORDER = ['Lower Risk', 'Lower to Medium Risk', 'Medium to High Risk', 'Higher Risk'];
+// Prudential's own site isn't perfectly consistent in how it labels risk
+// tiers (e.g. "Low to Medium Risk" vs "Lower to Medium Risk" both appear
+// across different fund pages) - matching on exact strings silently
+// breaks color-coding and sort order for whichever variant wasn't
+// hardcoded. Keyword-based tiering is robust to that.
+function riskTier(riskLabel) {
+    const r = (riskLabel || '').toLowerCase();
+    if (r.includes('higher')) return 3;
+    if (r.includes('medium') && r.includes('high')) return 2;
+    if (r.includes('medium')) return 1;
+    if (r.includes('low')) return 0;
+    return -1; // unrecognised label - sorts last, no color class applied
+}
+const RISK_TIER_CLASSES = ['risk-tier-0', 'risk-tier-1', 'risk-tier-2', 'risk-tier-3'];
 
 function renderRiskFilters() {
     const verifiedFunds = getVerifiedFunds();
     const risks = [...new Set(verifiedFunds.map(f => f.riskCategory))]
-        .sort((a, b) => RISK_ORDER.indexOf(a) - RISK_ORDER.indexOf(b));
+        .sort((a, b) => riskTier(a) - riskTier(b));
     const chips = ['all', ...risks].map(risk => {
         const count = risk === 'all' ? verifiedFunds.length : verifiedFunds.filter(f => f.riskCategory === risk).length;
         const label = risk === 'all' ? 'All' : risk;
