@@ -100,8 +100,21 @@ def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
 
 
 def normalize(name: str) -> str:
+    # IMPORTANT: this key is used to match a scraped fund page back to the
+    # right entry in data.json. Share-class markers like (Acc)/(Dis)/(USD)
+    # are NOT formatting noise - they identify genuinely different funds
+    # with different real prices (e.g. "PRULink Global Equity Fund" and
+    # "PRULink Global Equity Fund (USD) (Acc)" are two separate funds).
+    # An earlier version of this function stripped those markers entirely,
+    # which collapsed ~24 distinct funds across 10 groups into shared keys -
+    # causing the scraper to only capture one fund per group and silently
+    # skip or duplicate data for the others. Only case/spacing/punctuation
+    # and spelled-out-vs-abbreviated wording (e.g. "Accumulation" vs "Acc")
+    # are safe to normalize away; the share class itself must stay.
     n = (name or "").lower()
-    n = re.sub(r"\(accumulation\)|\(acc\)|\(distribution\)|\(dis\)|\(decu\)|\(usd\)|\(sgd\)", "", n)
+    n = n.replace("accumulation", "acc")
+    n = n.replace("distribution", "dis")
+    n = n.replace("decumulation", "decu")
     n = re.sub(r"[^a-z0-9]+", "", n)
     return n
 
@@ -189,6 +202,64 @@ def make_synthetic_history_full(seed_name: str, bid: float, weeks: int = 520):
     return series
 
 
+def dedupe_existing_funds(data: dict, debug: bool = False) -> None:
+    """
+    Self-healing cleanup: earlier versions of this script had matching bugs
+    that could leave two data.json entries for what's really the same fund
+    (e.g. one named "... (Decu)" and a stray duplicate named
+    "... (Decumulation)" from before that wording was recognized as the
+    same thing). This merges any such duplicates BEFORE matching newly
+    scraped data, so stale bugs from past runs don't linger forever just
+    because the script itself only adds/updates and never used to remove.
+
+    When duplicates are found, the entry with more real data
+    (dataSource == "verified-live", then whichever has a non-empty code)
+    is kept; the other is dropped. Its price history entries are dropped
+    too, keyed by whichever name is removed.
+    """
+    funds = data["funds"]["funds"]
+    groups: dict = {}
+    for f in funds:
+        groups.setdefault(normalize(f["name"]), []).append(f)
+
+    kept = []
+    removed_names = []
+    for key, group in groups.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+
+        def score(f):
+            name = f["name"]
+            # Prefer the entry using this dataset's established abbreviated
+            # naming convention - e.g. "(Decu)" over a spelled-out
+            # "(Decumulation)" duplicate. Whichever entry survives gets
+            # this run's freshly scraped data written onto it right after
+            # this function returns, so which one had *better* data before
+            # now doesn't matter - only which *name* to keep does.
+            spelled_out = any(w in name for w in ("Accumulation", "Distribution", "Decumulation"))
+            return (0 if spelled_out else 1, -len(name))
+
+        group.sort(key=score, reverse=True)
+        winner, losers = group[0], group[1:]
+        kept.append(winner)
+        for loser in losers:
+            removed_names.append(loser["name"])
+        if debug:
+            print(f"[debug] merged duplicate group -> kept {winner['name']!r}, "
+                  f"removed {[l['name'] for l in losers]!r}", file=sys.stderr)
+
+    if removed_names:
+        print(f"Cleaned up {len(removed_names)} stale duplicate fund(s) from earlier runs:")
+        for n in removed_names:
+            print(f"  - {n}")
+        for n in removed_names:
+            data.get("history", {}).pop(n, None)
+            data.get("history_full", {}).pop(n, None)
+
+    data["funds"]["funds"] = kept
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", help="Excel file (.xlsx/.xlsm) with one fund URL per row, header in row 1")
@@ -226,6 +297,7 @@ def main():
         return
 
     data = json.loads(DATA_PATH.read_text())
+    dedupe_existing_funds(data, debug=args.debug)
     by_key = {normalize(s["scraped_name"]): s for s in scraped if s.get("scraped_name")}
     existing_keys = {normalize(f["name"]) for f in data["funds"]["funds"]}
 
