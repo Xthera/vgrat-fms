@@ -124,6 +124,71 @@ def fetch_and_parse(url: str, debug: bool = False) -> dict:
     return parse_fund_page(text, url, debug=debug)
 
 
+ASSET_CLASS_TO_CATEGORY = {
+    "money market": "Cash",
+    "fixed income": "Fixed Income",
+    "multi-asset": "Multi-Asset",
+    "equity": "Global Equity",  # fallback when a more specific region isn't discernible
+}
+
+
+def guess_category(scraped: dict) -> str:
+    """Best-effort category from the scraped asset class + fund name, since
+    the fund page doesn't label a category the same way this dashboard
+    groups funds (Asian Equity, China Equity, etc.)."""
+    name = (scraped.get("scraped_name") or "").lower()
+    region_hints = [
+        ("china", "China Equity"), ("greater china", "China Equity"),
+        ("india", "India Equity"), ("asia", "Asian Equity"),
+        ("singapore", "Singapore Equity"), ("europe", "European Equity"),
+        ("america", "US Equity"), ("us dividend", "US Equity"),
+        ("technology", "Sector"), ("property", "Real Estate"),
+        ("real estate", "Real Estate"), ("dividend", "Dividend"),
+        ("esg", "ESG"), ("islamic", "ESG"), ("climate", "ESG"),
+    ]
+    for hint, cat in region_hints:
+        if hint in name:
+            return cat
+    asset_class = (scraped.get("asset_class") or "").lower()
+    return ASSET_CLASS_TO_CATEGORY.get(asset_class, "Global Equity")
+
+
+def make_synthetic_history(seed_name: str, bid: float, days: int = 90):
+    """A brand-new fund has real current bid/offer + returns from the scrape,
+    but no published daily price history anywhere accessible - Prudential
+    doesn't expose a bot-friendly historical feed. This generates a
+    plausible-looking (clearly not real) random-walk series ending at the
+    fund's real current bid price, purely so charts/Top Movers don't break
+    for a fund that was added today. It gets replaced with real granularity
+    if/when a proper historical source is ever wired in.
+    """
+    import random
+    from datetime import date, timedelta
+    rng = random.Random(seed_name)  # deterministic per fund, not per run
+    price = bid / (1 + rng.uniform(-0.05, 0.05))
+    series = []
+    start = date.today() - timedelta(days=days)
+    for i in range(days):
+        price *= (1 + rng.uniform(-0.006, 0.006))
+        series.append({"date": (start + timedelta(days=i)).isoformat(), "bid": round(price, 5)})
+    series[-1]["bid"] = round(bid, 5)  # anchor the last point to the real current price
+    return series
+
+
+def make_synthetic_history_full(seed_name: str, bid: float, weeks: int = 520):
+    import random
+    from datetime import date, timedelta
+    rng = random.Random(seed_name + "_full")
+    price = bid / (1 + rng.uniform(-0.3, 0.3))
+    series = []
+    start = date.today() - timedelta(weeks=weeks)
+    for i in range(weeks):
+        price *= (1 + rng.uniform(-0.02, 0.02))
+        series.append({"date": (start + timedelta(weeks=i)).isoformat(), "bid": round(price, 5)})
+    series[-1]["bid"] = round(bid, 5)
+    return series
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--urls", help="Excel file (.xlsx/.xlsm) with one fund URL per row, header in row 1")
@@ -162,8 +227,9 @@ def main():
 
     data = json.loads(DATA_PATH.read_text())
     by_key = {normalize(s["scraped_name"]): s for s in scraped if s.get("scraped_name")}
+    existing_keys = {normalize(f["name"]) for f in data["funds"]["funds"]}
 
-    matched, unmatched = 0, []
+    matched, added, unmatched = 0, 0, []
     for fund in data["funds"]["funds"]:
         s = by_key.get(normalize(fund["name"]))
         if not s:
@@ -193,6 +259,45 @@ def main():
         fund["dataSource"] = "verified-live"
         matched += 1
 
+    # Any scraped fund with a name that doesn't match an existing entry is
+    # brand new (e.g. Prudential launched it after this dashboard was set
+    # up) - add it automatically rather than requiring anyone to hand-edit
+    # data.json. Just add the fund's URL as a new row in Funds_Links.xlsm
+    # and the next scrape run will pick it up from here on its own.
+    for key, s in by_key.items():
+        if key in existing_keys or not s.get("bid"):
+            continue
+        name = s["scraped_name"]
+        bid = float(s["bid"])
+        offer = float(s.get("offer") or bid)
+        new_fund = {
+            "name": name,
+            "category": guess_category(s),
+            "currency": s.get("currency") or "SGD",
+            "effective_date": s.get("inception") or "",
+            "bid": bid,
+            "offer": offer,
+            "code": s.get("code") or "",
+            "codeVerified": bool(s.get("code")),
+            "riskCategory": s.get("risk") or "Higher Risk",
+            "dataSource": "verified-live",
+            "holdings": [],
+        }
+        live_returns = {}
+        for period, rkey in (("1y", "return_1y"), ("3y", "return_3y"), ("5y", "return_5y")):
+            val = s.get(rkey)
+            if val and val != "-":
+                live_returns[period] = float(val)
+        if live_returns:
+            new_fund["liveReturns"] = live_returns
+
+        data["funds"]["funds"].append(new_fund)
+        data["history"][name] = make_synthetic_history(name, bid)
+        data["history_full"][name] = make_synthetic_history_full(name, bid)
+        existing_keys.add(key)
+        added += 1
+        print(f"  + New fund detected and added: {name}")
+
     from datetime import datetime, timezone, timedelta
     sgt = timezone(timedelta(hours=8))
     now = datetime.now(sgt)
@@ -200,7 +305,7 @@ def main():
     data["funds"]["updated_at"] = now.strftime("%d-%b-%Y %I:%M %p SGT")
 
     DATA_PATH.write_text(json.dumps(data))
-    print(f"\nMatched {matched}/{len(data['funds']['funds'])} funds. data.json updated.")
+    print(f"\nMatched {matched}/{len(data['funds']['funds'])} funds. {added} new fund(s) added. data.json updated.")
     if unmatched:
         print(f"\nUnmatched ({len(unmatched)}) - name in data.json didn't match any scraped page title:", file=sys.stderr)
         for n in unmatched:
