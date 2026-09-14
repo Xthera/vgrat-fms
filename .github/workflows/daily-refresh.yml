@@ -33,4 +33,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data.json
           git diff --staged --quiet && echo "No changes" || git commit -m "Daily fund data refresh"
+          git pull --rebase origin main
           git push
