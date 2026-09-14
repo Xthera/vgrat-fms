@@ -315,10 +315,32 @@ def main():
             fund["riskCategory"] = s["risk"]
         if s.get("currency"):
             fund["currency"] = s["currency"]
+        if s.get("inception"):
+            fund["effective_date"] = s["inception"]
+
+        bid_changed = False
         if s.get("bid"):
-            fund["bid"] = float(s["bid"])
+            new_bid = float(s["bid"])
+            if fund.get("bid") != new_bid:
+                bid_changed = True
+            fund["bid"] = new_bid
         if s.get("offer"):
             fund["offer"] = float(s["offer"])
+
+        if bid_changed:
+            # The chart and 1D/1M/3M return calculations read from
+            # history/history_full, which are synthetic day-by-day series
+            # (Prudential doesn't publish a bot-accessible daily price
+            # feed). Those series were anchored to whatever the bid price
+            # was the last time they were generated - if we update `bid`
+            # here without also regenerating them, the fund's "current
+            # price" and its own price chart end up disagreeing with each
+            # other, and every return calculated off the stale series
+            # comes out wrong. Rebasing on every real bid change keeps
+            # them consistent.
+            name = fund["name"]
+            data.setdefault("history", {})[name] = make_synthetic_history(name, fund["bid"])
+            data.setdefault("history_full", {})[name] = make_synthetic_history_full(name, fund["bid"])
 
         live_returns = {}
         for period, key in (("1y", "return_1y"), ("3y", "return_3y"), ("5y", "return_5y")):
