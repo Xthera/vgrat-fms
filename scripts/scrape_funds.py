@@ -70,13 +70,21 @@ FIELD_PATTERNS = {
 }
 
 # The <h1> on each page renders as "PRULink <rest of name>" (bold markers vary)
-NAME_PATTERN = re.compile(r"#\s*\**PRU\**Link\**\s+([^\n]+)", re.I)
+# NOTE: earlier version of this pattern required a literal "#" and "**"
+# markdown-style markers - those were artifacts of how Claude's own fetch
+# tool renders pages as markdown, and don't exist in Playwright's plain
+# page.inner_text() output. Real rendered text is just:
+#   PRULink ActiveInvest Portfolio - Moderate (Accumulation)
+# on its own line, with no symbols. This matches the first "PRULink ..." or
+# "PRUPrime ..." occurrence, which is reliably the page's H1 title (it
+# appears before any other mention of the brand name elsewhere on the page).
+NAME_PATTERN = re.compile(r"\b(PRU(?:Link|Prime)\s+[^\n]+)", re.I)
 
 
 def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
     result = {"url": url}
     name_match = NAME_PATTERN.search(text)
-    result["scraped_name"] = ("PRULink " + name_match.group(1).strip(" *")) if name_match else None
+    result["scraped_name"] = name_match.group(1).strip(" *") if name_match else None
 
     for key, pattern in FIELD_PATTERNS.items():
         m = pattern.search(text)
