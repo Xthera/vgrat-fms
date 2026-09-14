@@ -427,12 +427,19 @@ function renderIndicesTicker() {
 }
 
 // ==================== FUND TABLE ====================
+// Only funds successfully pulled from the live Prudential scrape are shown
+// on the All Funds page - anything still on synthetic/placeholder data is
+// excluded rather than shown with unverified figures.
+function getVerifiedFunds() {
+    return allFunds.filter(f => f.dataSource === 'verified-live');
+}
+
 function renderFundTable() {
     const returns = calculateReturns('3M');
     const returnMap = {};
     returns.forEach(r => returnMap[r.name] = r.return);
 
-    let funds = allFunds.map(f => ({ ...f, change: returnMap[f.name] || 0 }));
+    let funds = getVerifiedFunds().map(f => ({ ...f, change: returnMap[f.name] || 0 }));
 
     if (activeCategory !== 'all') {
         funds = funds.filter(f => f.category === activeCategory);
@@ -484,9 +491,10 @@ function renderFundTable() {
 
 // ==================== CATEGORY FILTERS ====================
 function renderCategoryFilters() {
-    const categories = [...new Set(allFunds.map(f => f.category))].sort();
+    const verifiedFunds = getVerifiedFunds();
+    const categories = [...new Set(verifiedFunds.map(f => f.category))].sort();
     const chips = ['all', ...categories].map(cat => {
-        const count = cat === 'all' ? allFunds.length : allFunds.filter(f => f.category === cat).length;
+        const count = cat === 'all' ? verifiedFunds.length : verifiedFunds.filter(f => f.category === cat).length;
         const label = cat === 'all' ? 'All' : cat;
         return `<span class="chip ${activeCategory === cat ? 'active' : ''}" onclick="filterCategory('${cat}')">${label} (${count})</span>`;
     }).join('');
@@ -507,10 +515,11 @@ function filterCategory(cat) {
 const RISK_ORDER = ['Lower Risk', 'Lower to Medium Risk', 'Medium to High Risk', 'Higher Risk'];
 
 function renderRiskFilters() {
-    const risks = [...new Set(allFunds.map(f => f.riskCategory))]
+    const verifiedFunds = getVerifiedFunds();
+    const risks = [...new Set(verifiedFunds.map(f => f.riskCategory))]
         .sort((a, b) => RISK_ORDER.indexOf(a) - RISK_ORDER.indexOf(b));
     const chips = ['all', ...risks].map(risk => {
-        const count = risk === 'all' ? allFunds.length : allFunds.filter(f => f.riskCategory === risk).length;
+        const count = risk === 'all' ? verifiedFunds.length : verifiedFunds.filter(f => f.riskCategory === risk).length;
         const label = risk === 'all' ? 'All' : risk;
         return `<span class="chip ${activeRisk === risk ? 'active' : ''}" onclick="filterRisk('${risk}')">${label} (${count})</span>`;
     }).join('');
