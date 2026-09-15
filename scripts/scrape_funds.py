@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 Rebuilds data.json's entire fund list from scratch every run, using
@@ -1995,4 +1994,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
