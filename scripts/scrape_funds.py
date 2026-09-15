@@ -443,6 +443,7 @@ def main():
     ap.add_argument("--capture-history", action="store_true",
                      help="Log candidate chart/price API responses per fund to history_capture/ for inspection - doesn't write data.json")
     ap.add_argument("--dry-run", action="store_true", help="Print parsed results without writing data.json")
+    ap.add_argument("--limit", type=int, help="Only process the first N URLs (useful for quick/exploratory runs)")
 
     args = ap.parse_args()
 
