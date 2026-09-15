@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright openpyxl
+          pip install playwright openpyxl pdfplumber requests
           playwright install --with-deps chromium
 
       - name: Scrape latest fund data
