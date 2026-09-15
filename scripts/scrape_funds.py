@@ -166,48 +166,53 @@ HOLDINGS_BLOCK_PATTERN = re.compile(
     re.S | re.I
 )
 
-# Within that block, a well-formed line is "NAME  X.X%" on one line.
-HOLDING_LINE_PATTERN = re.compile(r"^(.+?)\s+([\d.]+)\s*%\s*$")
+# Within that block, a well-formed entry is "NAME" immediately followed
+# by a percentage - but NOT necessarily on one line or with a space
+# between them. Verified against two real, differently-formatted
+# factsheets:
+#   - Equity fund: "HDFC BANK LTD 6.3%" - one line, space before %.
+#   - Fund-of-funds: name wraps across two PDF-extracted lines and the
+#     percentage is glued directly onto the end with NO space, e.g.
+#     "Fidelity Funds SICAV - Global Dividend Fund \nDistribution
+#     AMINCOME(G)-SGD38.5%". A per-line regex mis-splits this into a
+#     fragment ("Distribution AMINCOME(G)-SGD") instead of the real name.
+# Collapsing the whole block's whitespace into single spaces and matching
+# "letters-then-a-number" across the resulting string handles both: the
+# non-greedy [^%]* naturally stops exactly at the digit boundary even
+# with no space there, and multi-line names get rejoined correctly since
+# there's no line boundary left to break on.
+HOLDING_ENTRY_PATTERN = re.compile(r"([A-Za-z][^%]*?)\s*(\d+(?:\.\d+)?)\s*%")
 
 
 def parse_holdings(text: str, debug_url: str = "") -> list:
     """
     Extracts real Top 10 Holdings from a factsheet's extracted text.
 
-    KNOWN LIMITATION: PDF text extraction linearizes what's really a
-    multi-column layout, which sometimes separates the last 1-2 holdings'
-    names from their percentages (verified against a real factsheet - the
-    9th/10th entries came through as bare "2.9%" / "2.8%" lines with their
-    actual company names having been pushed elsewhere in the extracted
-    text, mixed in with unrelated sidebar fields). Rather than guess which
-    nearby all-caps text might be the missing name - which risks attaching
-    a WRONG name to a real number - this only returns holdings where the
-    name and percentage were adjacent in the source text. That means some
-    funds may show 7-9 real holdings instead of a full 10; that's a
-    genuine data gap, not a bug to "fix" by fabricating a name.
+    KNOWN LIMITATION: for some equity-fund factsheets, PDF text extraction
+    linearizes what's really a multi-column layout, which can separate a
+    holding's name from its percentage entirely (verified against a real
+    factsheet - the 9th/10th entries came through as a bare percentage
+    with no adjacent name at all, the name having been pushed elsewhere
+    in the extracted text). Since HOLDING_ENTRY_PATTERN requires a name
+    immediately before the percentage, an entry like that simply isn't
+    captured - some funds may show fewer than 10 real holdings. That's a
+    genuine data gap, not a bug to "fix" by guessing a name.
     """
     block_match = HOLDINGS_BLOCK_PATTERN.search(text)
     if not block_match:
         return []
 
-    holdings = []
-    for line in block_match.group(1).split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        m = HOLDING_LINE_PATTERN.match(line)
-        if not m:
-            continue
-        name, pct = m.group(1).strip(), float(m.group(2))
-        # A bare percentage with no real name attached (see docstring) -
-        # skip rather than fabricate.
-        if not name or re.match(r"^[\d.]+$", name):
-            continue
-        holdings.append({"name": name, "weight": pct})
+    collapsed = re.sub(r"\s+", " ", block_match.group(1)).strip()
 
-    if debug_url and len(holdings) < 8:
-        print(f"[debug] {debug_url}: only found {len(holdings)} holdings "
-              f"(some names may have been separated from their % by PDF extraction)",
+    holdings = []
+    for name, pct in HOLDING_ENTRY_PATTERN.findall(collapsed):
+        name = name.strip(" -\u2022")
+        if not name:
+            continue
+        holdings.append({"name": name, "weight": float(pct)})
+
+    if debug_url and len(holdings) < 4:
+        print(f"[debug] {debug_url}: only found {len(holdings)} holdings",
               file=sys.stderr)
 
     return holdings[:10]
@@ -309,19 +314,43 @@ def load_urls_from_excel(path: str) -> list:
     ]
 
 
-def fetch_and_parse(url: str, debug: bool = False) -> dict:
+def fetch_and_parse(url: str, debug: bool = False, capture_history: bool = False) -> dict:
     from playwright.sync_api import sync_playwright
+
+    captured = []
+
+    def on_response(response):
+        # Real bid-bid history feeds the page's interactive chart, which
+        # isn't present in the plain page text - it's loaded via a
+        # background API call. Rather than guess that call's URL/shape,
+        # this logs every response that plausibly could be it so a real
+        # run can reveal the actual endpoint and JSON structure to parse.
+        try:
+            u = response.url.lower()
+            if not any(k in u for k in ("chart", "price", "performance", "history", "nav", "/api/", ".json")):
+                return
+            ctype = response.headers.get("content-type", "")
+            body = response.text() if ("json" in ctype or "javascript" in ctype) else None
+            captured.append({"url": response.url, "status": response.status,
+                              "content_type": ctype, "body": body})
+        except Exception:
+            pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
 
         page = browser.new_page()
+        if capture_history:
+            page.on("response", on_response)
 
         page.goto(
             url,
             wait_until="networkidle",
             timeout=30000
         )
+        if capture_history:
+            # give any lazily-triggered chart JS a little extra time
+            page.wait_for_timeout(2000)
 
         text = page.inner_text("body")
         factsheet_url = find_factsheet_url(page)
@@ -342,6 +371,13 @@ def fetch_and_parse(url: str, debug: bool = False) -> dict:
             if debug:
                 print(f"[debug] {url}: factsheet holdings extraction failed ({factsheet_url}): {e}",
                       file=sys.stderr)
+
+    if capture_history:
+        out_dir = Path("history_capture")
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / (re.sub(r"[^a-z0-9]+", "_", url.lower()).strip("_") + ".json")
+        out_path.write_text(json.dumps(captured, indent=2))
+        print(f"  captured {len(captured)} candidate response(s) -> {out_path}", file=sys.stderr)
 
     return result
 
@@ -404,6 +440,8 @@ def main():
     ap.add_argument("--input-html", help="Parse one saved page's text instead of fetching (for testing the regex)")
     ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests - be polite to their servers")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--capture-history", action="store_true",
+                     help="Log candidate chart/price API responses per fund to history_capture/ for inspection - doesn't write data.json")
     ap.add_argument("--dry-run", action="store_true", help="Print parsed results without writing data.json")
 
     args = ap.parse_args()
@@ -418,17 +456,24 @@ def main():
         sys.exit(1)
 
     urls = load_urls_from_excel(args.urls)
+    if args.limit:
+        urls = urls[:args.limit]
     print(f"Loaded {len(urls)} fund URLs from {args.urls}")
 
     scraped = []
     for i, url in enumerate(urls, 1):
         try:
-            data = fetch_and_parse(url, debug=args.debug)
+            data = fetch_and_parse(url, debug=args.debug, capture_history=args.capture_history)
             scraped.append(data)
             print(f"[{i}/{len(urls)}] {data.get('scraped_name') or url} -> code={data.get('code')} risk={data.get('risk')} bid={data.get('bid')}")
         except Exception as e:
             print(f"[{i}/{len(urls)}] FAILED {url}: {e}", file=sys.stderr)
         time.sleep(args.delay)
+
+    if args.capture_history:
+        print(f"\nDone. Inspect the history_capture/*.json files, then share a couple of them "
+              f"so the real chart data endpoint can be parsed properly.")
+        return
 
     if args.dry_run:
         Path("scraped_raw.json").write_text(json.dumps(scraped, indent=2))
