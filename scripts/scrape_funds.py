@@ -73,16 +73,21 @@ Price history: synthetic history is intentionally NOT generated.
 Holdings: REAL Top 10 Holdings are extracted from each fund's factsheet
 PDF (linked from its own page as "View factsheet"). No fabricated
 holdings are used.
+  - Extraction uses each PDF page's word-level POSITION (x/y coordinates
+    via pdfplumber's extract_words()), not the flattened text stream -
+    factsheets often place an unrelated sidebar at a similar vertical
+    position to the holdings list, which can interleave that sidebar's
+    text with the holdings in plain linear extraction. Clustering words
+    into rows by actual position avoids that.
+  - Accepts 1-10 holdings; does not require exactly 10.
+  - A holding name that wraps across two printed lines is reassembled
+    from the row(s) above the row containing its percentage.
+  - A percentage with no name text anywhere in its row or in a pending
+    wrapped-name above it is REJECTED, not fabricated - see
+    _holdings_from_words() for the exact rule.
   - A fund with no factsheet link, or whose factsheet PDF isn't in the
     expected "Top Holdings" format, gets an empty holdings list rather
     than a guess.
-  - PDF text extraction can separate a holding's name from its
-    percentage when the source PDF uses a multi-column layout (verified
-    against a real factsheet: the 9th/10th entries can come through as a
-    bare percentage with no adjacent name). Rather than guess which
-    nearby text might be the missing name, those entries are simply
-    dropped - some funds may show 7-9 real holdings instead of a full
-    10. See parse_holdings() for details.
 
 USAGE
 -----
@@ -160,62 +165,119 @@ NAME_PATTERN = re.compile(
 # heading and whatever comes after it (a footnote "Source:" line, or the
 # next section like "Sector Allocation"). Handles the optional footnote
 # digit Prudential appends (e.g. "Top 10 Holdings3").
-HOLDINGS_BLOCK_PATTERN = re.compile(
-    r"Top (?:10 )?Holdings\d*\s*\n(.*?)"
-    r"(?:\n\d*Source|\nSector Allocation|\nCountry Allocation|\nAsset Allocation|\Z)",
-    re.S | re.I
-)
-
-# Within that block, a well-formed entry is "NAME" immediately followed
-# by a percentage - but NOT necessarily on one line or with a space
-# between them. Verified against two real, differently-formatted
-# factsheets:
-#   - Equity fund: "HDFC BANK LTD 6.3%" - one line, space before %.
-#   - Fund-of-funds: name wraps across two PDF-extracted lines and the
-#     percentage is glued directly onto the end with NO space, e.g.
-#     "Fidelity Funds SICAV - Global Dividend Fund \nDistribution
-#     AMINCOME(G)-SGD38.5%". A per-line regex mis-splits this into a
-#     fragment ("Distribution AMINCOME(G)-SGD") instead of the real name.
-# Collapsing the whole block's whitespace into single spaces and matching
-# "letters-then-a-number" across the resulting string handles both: the
-# non-greedy [^%]* naturally stops exactly at the digit boundary even
-# with no space there, and multi-line names get rejoined correctly since
-# there's no line boundary left to break on.
-HOLDING_ENTRY_PATTERN = re.compile(r"([A-Za-z][^%]*?)\s*(\d+(?:\.\d+)?)\s*%")
-
-
-def parse_holdings(text: str, debug_url: str = "") -> list:
+def _holdings_from_words(words: list, debug_url: str = "") -> list:
     """
-    Extracts real Top 10 Holdings from a factsheet's extracted text.
+    Pure function: turns a list of word dicts (as returned by pdfplumber's
+    page.extract_words(), each with 'text'/'x0'/'x1'/'top'/'bottom') into
+    a list of {name, weight} holdings, using each word's PHYSICAL POSITION
+    on the page rather than the flattened text stream's reading order.
 
-    KNOWN LIMITATION: for some equity-fund factsheets, PDF text extraction
-    linearizes what's really a multi-column layout, which can separate a
-    holding's name from its percentage entirely (verified against a real
-    factsheet - the 9th/10th entries came through as a bare percentage
-    with no adjacent name at all, the name having been pushed elsewhere
-    in the extracted text). Since HOLDING_ENTRY_PATTERN requires a name
-    immediately before the percentage, an entry like that simply isn't
-    captured - some funds may show fewer than 10 real holdings. That's a
-    genuine data gap, not a bug to "fix" by guessing a name.
+    Why position instead of text order: factsheets often lay out a
+    holdings list alongside an unrelated sidebar (fund facts, manager
+    info) at a similar vertical position. pdfplumber's default linear
+    text extraction can interleave that sidebar's lines with the holdings
+    list - verified against a real factsheet, where the 9th/10th holdings'
+    percentages ended up separated from their names by unrelated text
+    that had nothing to do with holdings at all. Clustering words into
+    rows by y-position, restricted to the holdings section's own x-range,
+    reads each row exactly where it's printed instead.
+
+    Rules (per spec):
+      - Accepts 1-10 holdings; does not require exactly 10.
+      - A name that wraps across two printed lines is reassembled from
+        the row(s) immediately above the row containing the percentage.
+      - A percentage with no name text in its own row AND no pending
+        wrapped-name text above it is REJECTED, not fabricated - there's
+        nothing genuine to attach it to.
     """
-    block_match = HOLDINGS_BLOCK_PATTERN.search(text)
-    if not block_match:
+    heading = next((w for w in words if "holdings" in w["text"].lower()), None)
+    if not heading:
         return []
 
-    collapsed = re.sub(r"\s+", " ", block_match.group(1)).strip()
+    heading_top = heading["top"]
+    # Column bounds: no left constraint (a heading's own x-position isn't
+    # reliably aligned with where the row content below it starts - an
+    # earlier version anchored the left bound to the heading's x0 and it
+    # clipped real name text that started slightly further left, e.g.
+    # "HDFC" got cut from "HDFC BANK LTD"). The right bound stays
+    # generous but bounded, to exclude a same-height sidebar column that
+    # some factsheet layouts place to the right of the holdings list.
+    col_x0 = 0
+    col_x1 = heading["x1"] + 260
+
+    stop_words = {"source", "sector", "country", "asset", "allocation"}
+    end_candidates = [
+        w["top"] for w in words
+        if w["top"] > heading_top + 5
+        and w["text"].strip(":").lower() in stop_words
+    ]
+    end_top = min(end_candidates) if end_candidates else heading_top + 400
+
+    block_words = [
+        w for w in words
+        if heading_top < w["top"] < end_top and col_x0 <= w["x0"] <= col_x1
+    ]
+    if not block_words:
+        return []
+
+    # Group words into printed rows by y-position. A small tolerance
+    # absorbs sub-pixel jitter between words that are visually on the
+    # same line but not bit-for-bit identical 'top' values.
+    rows: dict = {}
+    for w in block_words:
+        key = round(w["top"] / 3)
+        rows.setdefault(key, []).append(w)
 
     holdings = []
-    for name, pct in HOLDING_ENTRY_PATTERN.findall(collapsed):
-        name = name.strip(" -\u2022")
-        if not name:
-            continue
-        holdings.append({"name": name, "weight": float(pct)})
+    rejected = 0
+    pending_name_parts = []
 
-    if debug_url and len(holdings) < 4:
-        print(f"[debug] {debug_url}: only found {len(holdings)} holdings",
-              file=sys.stderr)
+    for key in sorted(rows):
+        row_words = sorted(rows[key], key=lambda w: w["x0"])
+        row_text = " ".join(w["text"] for w in row_words)
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*$", row_text)
+
+        if not m:
+            # A row with no trailing percentage is either a wrapped
+            # continuation of the next holding's name, or unrelated text
+            # that happened to fall in this column/range - either way it
+            # only becomes part of a holding if a percentage row follows.
+            if row_text.strip():
+                pending_name_parts.append(row_text.strip())
+            continue
+
+        pct = float(m.group(1))
+        name_here = row_text[:m.start()].strip(" -\u2022")
+        full_name = " ".join(pending_name_parts + ([name_here] if name_here else [])).strip()
+        pending_name_parts = []
+
+        if full_name:
+            holdings.append({"name": full_name, "weight": pct})
+        else:
+            # A bare percentage with nothing genuine to attach it to.
+            # Reject rather than guess - never fabricate a holding.
+            rejected += 1
+
+    if debug_url:
+        if rejected:
+            print(f"[debug] {debug_url}: rejected {rejected} ambiguous "
+                  f"percentage row(s) with no associated name", file=sys.stderr)
+        if len(holdings) < 4:
+            print(f"[debug] {debug_url}: only found {len(holdings)} holdings", file=sys.stderr)
 
     return holdings[:10]
+
+
+def parse_holdings(pdf, debug_url: str = "") -> list:
+    """Tries each page of the factsheet (the holdings table is usually on
+    page 1, but this doesn't assume that) and returns the first page that
+    yields any holdings at all."""
+    for page in pdf.pages:
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+        holdings = _holdings_from_words(words, debug_url=debug_url)
+        if holdings:
+            return holdings
+    return []
 
 
 def find_factsheet_url(page) -> str:
@@ -236,8 +298,9 @@ def find_factsheet_url(page) -> str:
 
 def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> list:
     """Downloads the factsheet PDF (plain HTTP - PDFs aren't subject to
-    the browser-JS-rendering concerns the main fund pages are) and
-    extracts text via pdfplumber for parse_holdings() to work on."""
+    the browser-JS-rendering concerns the main fund pages are) and hands
+    it to parse_holdings(), which reads each page's word positions
+    directly rather than a flattened text stream."""
     import requests
     import pdfplumber
     import io
@@ -245,15 +308,8 @@ def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> li
     resp = requests.get(factsheet_url, timeout=30)
     resp.raise_for_status()
 
-    text_parts = []
     with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-        for pg in pdf.pages:
-            t = pg.extract_text()
-            if t:
-                text_parts.append(t)
-    full_text = "\n".join(text_parts)
-
-    return parse_holdings(full_text, debug_url=factsheet_url if debug else "")
+        return parse_holdings(pdf, debug_url=factsheet_url if debug else "")
 
 
 def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
