@@ -1,0 +1,36 @@
+name: News refresh
+
+# Runs every 3 hours - news goes stale much faster than fund prices, so
+# this is separate from daily-refresh.yml (which handles fund data once a
+# day at 8am). Also runnable manually from the Actions tab any time.
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  refresh-news:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install feedparser
+
+      - name: Scrape latest news
+        run: python scripts/scrape_news.py
+
+      - name: Commit updated data.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data.json
+          git diff --staged --quiet && echo "No changes" || git commit -m "News refresh"
+          git pull --rebase origin main
+          git push
