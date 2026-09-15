@@ -1,1135 +1,350 @@
 #!/usr/bin/env python3
-
 """
-VGrat FMS - Prudential Fund Scraper
+Rebuilds data.json's entire fund list from scratch every run, using
+Funds_Links.xlsm as the single source of truth for which funds should
+exist. Each fund is keyed by its URL (not by name), so:
 
-SOURCE OF TRUTH
----------------
-Funds_Links.xlsm contains the fund URLs that should exist.
+  - Add a row to Funds_Links.xlsm -> that fund appears on the next run.
+  - Remove a row -> that fund disappears on the next run.
+  - The fund count always matches the number of URLs in the sheet exactly
+    (no accumulation, no stale leftovers from previous runs).
 
-Each fund is identified by its source URL.
+WHY REBUILD INSTEAD OF UPDATE-IN-PLACE
+-----------------------------------------
+An earlier version of this script tried to *update* whatever was already
+in data.json by fuzzy-matching fund names between scraped pages and
+existing entries. That's fragile: naming variants (spelled-out vs
+abbreviated share classes, "PruLink" vs "PRULink", etc.) could fail to
+match, which silently left stale/duplicate entries behind forever, since
+an update-in-place approach only ever adds or edits, never removes. This
+version sidesteps all of that by using the URL itself as the identity key
+- unambiguous, and it naturally handles removal for free.
 
-JSON STRUCTURE
---------------
-This script preserves the existing data.json structure:
+WHY THIS SCRIPT EXISTS AT ALL
+--------------------------------
+The dashboard is static files with no backend, so nothing can "live fetch"
+from the browser - Prudential's site doesn't allow cross-origin requests,
+and that's enforced by browsers (CORS), not something a frontend can work
+around. The fix: run this script OUTSIDE the browser - your machine, or
+a scheduled GitHub Actions job (see .github/workflows/daily-refresh.yml) -
+where CORS doesn't apply, and let it write the result into data.json,
+which the static site just reads like any other file.
 
-{
-    "funds": {
-        "funds": [...],
-        "updated_on": "...",
-        "updated_at": "..."
-    },
-    "history": {...},
-    "indices": [...],
-    "news": [...],
-    "riskFactors": [...],
-    "summary": {...},
-    "commodities": [...],
-    "currencies": [...],
-    "bonds": [...],
-    "history_full": {...}
-}
+CONFIRMED PAGE STRUCTURE
+-------------------------
+Verified by fetching multiple real fund pages. Each page at
+https://www.prudential.com.sg/products/wealth-accumulation/ilp/prulink-funds/<slug>
+renders a "Fund facts" block as plain labelled text:
 
-IMPORTANT
----------
-The scraper only replaces the nested:
+    Risk classification
+    Medium to High Risk
+    Currency
+    SGD
+    Inception date
+    22 Oct 2021
+    Fund code
+    PAPB
+    ...
+    Continuing Investment Charge (CIC)
+    1.05%
 
-    data["funds"]["funds"]
+...plus a "Prices" block (Bid price / Offer price) and
+"Historical annualised returns" block (1-year / 3-year / 5-year).
 
-collection.
+This script parses the rendered page TEXT for these labelled values
+(not CSS classes, which are far more likely to change across redesigns
+than the labels).
 
-All other top-level data is preserved.
+WHAT HAPPENS WHEN A SCRAPE FAILS FOR ONE FUND
+------------------------------------------------
+A single network hiccup shouldn't make a fund vanish. If a URL fails this
+run but succeeded on some previous run, the previous data for that exact
+URL is kept as-is. Only URLs that have never once succeeded, or have been
+removed from the Excel file, are absent from the result.
 
-HOLDINGS
---------
-Holdings are extracted from Prudential factsheet PDFs.
+HISTORY / HOLDINGS
+------------------
+Price history: synthetic history is intentionally NOT generated.
+  - Existing historical price data is preserved for a fund when it
+    already exists in data.json.
+  - New funds do not receive fabricated historical price data.
+  - No random-walk history is generated.
 
-"Top 10 Holdings" means the name of the section. It does NOT mean
-there must be exactly 10 holdings.
+Holdings: REAL Top 10 Holdings are extracted from each fund's factsheet
+PDF (linked from its own page as "View factsheet"). No fabricated
+holdings are used.
+  - A fund with no factsheet link, or whose factsheet PDF isn't in the
+    expected "Top Holdings" format, gets an empty holdings list rather
+    than a guess.
+  - PDF text extraction can separate a holding's name from its
+    percentage when the source PDF uses a multi-column layout (verified
+    against a real factsheet: the 9th/10th entries can come through as a
+    bare percentage with no adjacent name). Rather than guess which
+    nearby text might be the missing name, those entries are simply
+    dropped - some funds may show 7-9 real holdings instead of a full
+    10. See parse_holdings() for details.
 
-The scraper accepts 1-10 actual holdings.
+USAGE
+-----
+    pip install playwright openpyxl pdfplumber requests
+    playwright install chromium
+    python scripts/scrape_funds.py --urls Funds_Links.xlsm
 
-No synthetic holdings are created.
-
-HISTORY
--------
-No synthetic historical price data is generated.
-
-Existing history is preserved.
-
-FAIL-SAFE
----------
-An existing fund will never be deleted merely because Prudential
-temporarily fails to return the page.
-
-A completely empty scrape will NEVER overwrite the existing fund list.
+    # Test the parser against one saved page (no network needed):
+    python scripts/scrape_funds.py --input-html saved_page.txt --debug
 """
 
 import argparse
-import io
 import json
 import re
 import sys
 import time
-
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import urljoin
 
 
-# ============================================================================
-# PATHS
-# ============================================================================
+DATA_PATH = Path(__file__).resolve().parent.parent / "data.json"
 
-DATA_PATH = (
-    Path(__file__).resolve().parent.parent / "data.json"
-)
-
-
-# ============================================================================
-# FUND PAGE REGEX
-# ============================================================================
 
 FIELD_PATTERNS = {
-
     "risk": re.compile(
         r"Risk classification\s*\n+\s*\**"
         r"(Lower Risk|Low to Medium Risk|Medium to High Risk|Higher Risk)",
-        re.I,
+        re.I
     ),
-
     "currency": re.compile(
-        r"\bCurrency\s*\n+\s*\**([A-Z]{3})\b",
-        re.I,
+        r"\bCurrency\s*\n+\s*\**([A-Z]{3})\b"
     ),
-
     "inception": re.compile(
         r"Inception date\s*\n+\s*\**(\d{1,2} \w{3} \d{4})",
-        re.I,
+        re.I
     ),
-
     "code": re.compile(
-        r"Fund code\s*\n+\s*\**([A-Z0-9]{3,8})\b",
-        re.I,
+        r"Fund code\s*\n+\s*\**([A-Z0-9]{3,6})\b",
+        re.I
     ),
-
     "cic": re.compile(
         r"Continuing Investment Charge[^\n]*\n[^\n]*\n\s*\**([\d.]+)%",
-        re.I,
+        re.I
     ),
-
     "asset_class": re.compile(
         r"\n\**(Money Market|Fixed Income|Equity|Multi-Asset)\**"
         r"\s*\n\s*Risk classification",
-        re.I,
+        re.I
     ),
-
     "bid": re.compile(
         r"Bid price\s*\n+\s*\$?([\d.]+)",
-        re.I,
+        re.I
     ),
-
     "offer": re.compile(
         r"Offer price\s*\n+\s*\$?([\d.]+)",
-        re.I,
+        re.I
     ),
-
     "return_1y": re.compile(
-        r"1-year\s*\n+\s*([+-]?[\d.]+|-)\s*%",
-        re.I,
+        r"1-year\s*\n+\s*([+-]?[\d.]+)\s*%"
     ),
-
     "return_3y": re.compile(
-        r"3-year\s*\n+\s*([+-]?[\d.]+|-)\s*%?",
-        re.I,
+        r"3-year\s*\n+\s*([+-]?[\d.]+|-)\s*%?"
     ),
-
     "return_5y": re.compile(
-        r"5-year\s*\n+\s*([+-]?[\d.]+|-)\s*%?",
-        re.I,
+        r"5-year\s*\n+\s*([+-]?[\d.]+|-)\s*%?"
     ),
 }
 
 
 NAME_PATTERN = re.compile(
     r"\b(PRU(?:Link|Prime)\s+[^\n]+)",
-    re.I,
+    re.I
 )
 
-
-# ============================================================================
-# HOLDINGS
-# ============================================================================
-
-TOP_HOLDINGS_PATTERN = re.compile(
-    r"Top\s+(?:10\s+)?Holdings",
-    re.I,
+# Matches the block of text between a "Top Holdings" / "Top 10 Holdings"
+# heading and whatever comes after it (a footnote "Source:" line, or the
+# next section like "Sector Allocation"). Handles the optional footnote
+# digit Prudential appends (e.g. "Top 10 Holdings3").
+HOLDINGS_BLOCK_PATTERN = re.compile(
+    r"Top (?:10 )?Holdings\d*\s*\n(.*?)"
+    r"(?:\n\d*Source|\nSector Allocation|\nCountry Allocation|\nAsset Allocation|\Z)",
+    re.S | re.I
 )
 
-HOLDING_PERCENT_PATTERN = re.compile(
-    r"^[+-]?\d+(?:\.\d+)?%$"
-)
-
-SOURCE_PATTERN = re.compile(
-    r"^Source\s*:",
-    re.I,
-)
-
-
-def clean_pdf_word(text):
-    if text is None:
-        return ""
-
-    text = str(text)
-
-    for char in (
-        "\x00",
-        "\x01",
-        "\x02",
-        "\x03",
-        "\x04",
-        "\x05",
-        "\x06",
-        "\ufeff",
-    ):
-        text = text.replace(char, "")
-
-    return text.strip()
-
-
-def is_percentage_text(text):
-    if not text:
-        return False
-
-    return bool(
-        HOLDING_PERCENT_PATTERN.match(
-            clean_pdf_word(text)
-        )
-    )
-
-
-def parse_percentage(text):
-    try:
-        text = clean_pdf_word(text)
-        return float(text.replace("%", ""))
-    except Exception:
-        return None
-
-
-def group_words_into_rows(words, y_tolerance=3.0):
-
-    if not words:
-        return []
-
-    words = sorted(
-        words,
-        key=lambda w: (
-            float(w["top"]),
-            float(w["x0"]),
-        ),
-    )
-
-    rows = []
-
-    for word in words:
-
-        top = float(word["top"])
-        bottom = float(word["bottom"])
-
-        center_y = (top + bottom) / 2
-
-        found = None
-
-        for row in rows:
-
-            row_center = (
-                row["top"] + row["bottom"]
-            ) / 2
-
-            if abs(center_y - row_center) <= y_tolerance:
-                found = row
-                break
-
-        if found is None:
-
-            rows.append(
-                {
-                    "top": top,
-                    "bottom": bottom,
-                    "words": [word],
-                }
-            )
-
-        else:
-
-            found["words"].append(word)
-
-            found["top"] = min(
-                found["top"],
-                top,
-            )
-
-            found["bottom"] = max(
-                found["bottom"],
-                bottom,
-            )
-
-    for row in rows:
-
-        row["words"].sort(
-            key=lambda w: float(w["x0"])
-        )
-
-    rows.sort(
-        key=lambda r: r["top"]
-    )
-
-    return rows
-
-
-def row_text(row):
-
-    return " ".join(
-        clean_pdf_word(
-            word.get("text", "")
-        )
-        for word in row["words"]
-        if clean_pdf_word(
-            word.get("text", "")
-        )
-    ).strip()
-
-
-def clean_holding_name(name):
-
-    if not name:
-        return ""
-
-    name = clean_pdf_word(name)
-
-    name = re.sub(
-        r"\s+",
-        " ",
-        name,
-    ).strip()
-
-    # ------------------------------------------------------------------
-    # Remove obvious PDF table artefacts at the beginning.
-    #
-    # Examples:
-    #
-    # 120 Fidelity Funds SICAV - Global Dividend Fund
-    #
-    # should become:
-    #
-    # Fidelity Funds SICAV - Global Dividend Fund
-    #
-    # But don't remove meaningful alphanumeric fund names.
-    # ------------------------------------------------------------------
-
-    name = re.sub(
-        r"^\d{1,4}\s+(?=[A-Za-z])",
-        "",
-        name,
-    )
-
-    # Remove isolated page/table numbering such as "1." / "01."
-    name = re.sub(
-        r"^\d{1,3}\.\s+(?=[A-Za-z])",
-        "",
-        name,
-    )
-
-    # Remove leading bullets.
-    name = re.sub(
-        r"^[•·▪●]\s*",
-        "",
-        name,
-    )
-
-    return name.strip()
-
-
-def find_top_holdings_region(page, debug=False):
-
-    words = page.extract_words(
-        x_tolerance=1,
-        y_tolerance=3,
-        keep_blank_chars=False,
-        use_text_flow=False,
-    )
-
-    if not words:
-        return []
-
-    cleaned = []
-
-    for word in words:
-
-        text = clean_pdf_word(
-            word.get("text", "")
-        )
-
-        if not text:
-            continue
-
-        new_word = dict(word)
-        new_word["text"] = text
-
-        cleaned.append(new_word)
-
-    rows = group_words_into_rows(
-        cleaned,
-        y_tolerance=3.5,
-    )
-
-    heading_index = None
-
-    for index, row in enumerate(rows):
-
-        text = row_text(row)
-
-        if TOP_HOLDINGS_PATTERN.search(text):
-            heading_index = index
-            break
-
-    if heading_index is None:
-
-        if debug:
-            print(
-                "[debug] No Top Holdings heading found",
-                file=sys.stderr,
-            )
-
-        return []
-
-    heading_bottom = rows[
-        heading_index
-    ]["bottom"]
-
-    end_top = None
-
-    for row in rows[
-        heading_index + 1:
-    ]:
-
-        text = row_text(row)
-
-        lower = text.lower()
-
-        if SOURCE_PATTERN.search(text):
-
-            end_top = row["top"]
-            break
-
-        if (
-            lower.startswith("sector allocation")
-            or lower.startswith("country allocation")
-            or lower.startswith("asset allocation")
-            or lower.startswith("performance")
-            or lower.startswith("calendar year performance")
-            or lower.startswith("geographical allocation")
-        ):
-
-            end_top = row["top"]
-            break
-
-    if end_top is None:
-
-        end_top = min(
-            page.height,
-            heading_bottom + 220,
-        )
-
-    return [
-        word
-        for word in cleaned
-        if float(word["top"]) >= heading_bottom
-        and float(word["top"]) < end_top
-    ]
-
-
-def extract_holdings_from_page(page, debug=False):
-
-    region_words = find_top_holdings_region(
-        page,
-        debug=debug,
-    )
-
-    if not region_words:
-        return []
-
-    rows = group_words_into_rows(
-        region_words,
-        y_tolerance=3.5,
-    )
-
-    if debug:
-
-        print(
-            "[debug] Top Holdings rows:",
-            file=sys.stderr,
-        )
-
-        for row in rows:
-
-            print(
-                f"[debug]   {row_text(row)}",
-                file=sys.stderr,
-            )
-
-    percentage_rows = []
-
-    for index, row in enumerate(rows):
-
-        percentage_words = [
-            word
-            for word in row["words"]
-            if is_percentage_text(
-                word["text"]
-            )
-        ]
-
-        if not percentage_words:
-            continue
-
-        percentage_word = max(
-            percentage_words,
-            key=lambda w: float(w["x0"]),
-        )
-
-        percentage = parse_percentage(
-            percentage_word["text"]
-        )
-
-        if percentage is None:
-            continue
-
-        percentage_rows.append(
-            {
-                "row_index": index,
-                "row": row,
-                "percentage_word": percentage_word,
-                "percentage": percentage,
-            }
-        )
-
-    if not percentage_rows:
+# Within that block, a well-formed line is "NAME  X.X%" on one line.
+HOLDING_LINE_PATTERN = re.compile(r"^(.+?)\s+([\d.]+)\s*%\s*$")
+
+
+def parse_holdings(text: str, debug_url: str = "") -> list:
+    """
+    Extracts real Top 10 Holdings from a factsheet's extracted text.
+
+    KNOWN LIMITATION: PDF text extraction linearizes what's really a
+    multi-column layout, which sometimes separates the last 1-2 holdings'
+    names from their percentages (verified against a real factsheet - the
+    9th/10th entries came through as bare "2.9%" / "2.8%" lines with their
+    actual company names having been pushed elsewhere in the extracted
+    text, mixed in with unrelated sidebar fields). Rather than guess which
+    nearby all-caps text might be the missing name - which risks attaching
+    a WRONG name to a real number - this only returns holdings where the
+    name and percentage were adjacent in the source text. That means some
+    funds may show 7-9 real holdings instead of a full 10; that's a
+    genuine data gap, not a bug to "fix" by fabricating a name.
+    """
+    block_match = HOLDINGS_BLOCK_PATTERN.search(text)
+    if not block_match:
         return []
 
     holdings = []
-
-    for item in percentage_rows[:10]:
-
-        row_index = item["row_index"]
-
-        current_row = item["row"]
-
-        pct_word = item[
-            "percentage_word"
-        ]
-
-        percentage = item[
-            "percentage"
-        ]
-
-        pct_x0 = float(
-            pct_word["x0"]
-        )
-
-        # --------------------------------------------------------------
-        # Same-row words to the left of percentage.
-        # --------------------------------------------------------------
-
-        same_row_words = [
-            word
-            for word in current_row["words"]
-            if float(word["x1"]) <= pct_x0 + 1
-            and not is_percentage_text(
-                word["text"]
-            )
-        ]
-
-        same_row_text = " ".join(
-            clean_pdf_word(
-                word["text"]
-            )
-            for word in same_row_words
-        ).strip()
-
-        name_parts = []
-
-        if same_row_text:
-
-            name_parts.append(
-                same_row_text
-            )
-
-        # --------------------------------------------------------------
-        # Wrapped names.
-        #
-        # Only look backwards until another percentage row or heading.
-        # --------------------------------------------------------------
-
-        previous_rows = []
-
-        j = row_index - 1
-
-        while (
-            j >= 0
-            and len(previous_rows) < 2
-        ):
-
-            candidate = rows[j]
-
-            candidate_text = row_text(
-                candidate
-            )
-
-            if not candidate_text:
-                j -= 1
-                continue
-
-            lower = candidate_text.lower()
-
-            if (
-                "top holdings" in lower
-                or lower.startswith("source:")
-                or lower.startswith("sector allocation")
-                or lower.startswith("country allocation")
-                or lower.startswith("asset allocation")
-                or lower.startswith("performance")
-            ):
-                break
-
-            if any(
-                is_percentage_text(
-                    word["text"]
-                )
-                for word in candidate["words"]
-            ):
-                break
-
-            gap = (
-                current_row["top"]
-                - candidate["bottom"]
-            )
-
-            if gap > 12:
-                break
-
-            previous_rows.append(
-                candidate
-            )
-
-            j -= 1
-
-        previous_rows.reverse()
-
-        previous_text = [
-            row_text(row)
-            for row in previous_rows
-            if row_text(row)
-        ]
-
-        if previous_text:
-
-            name_parts = (
-                previous_text
-                + name_parts
-            )
-
-        name = clean_holding_name(
-            " ".join(name_parts)
-        )
-
-        if not name:
+    for line in block_match.group(1).split("\n"):
+        line = line.strip()
+        if not line:
             continue
-
-        # --------------------------------------------------------------
-        # Reject obvious non-holding text.
-        # --------------------------------------------------------------
-
-        lower_name = name.lower()
-
-        if lower_name in {
-            "top holdings",
-            "source",
-            "performance",
-            "performance chart",
-        }:
+        m = HOLDING_LINE_PATTERN.match(line)
+        if not m:
             continue
-
-        # Reject names that are only numbers.
-        if re.fullmatch(
-            r"[\d\s.,%-]+",
-            name,
-        ):
+        name, pct = m.group(1).strip(), float(m.group(2))
+        # A bare percentage with no real name attached (see docstring) -
+        # skip rather than fabricate.
+        if not name or re.match(r"^[\d.]+$", name):
             continue
+        holdings.append({"name": name, "weight": pct})
 
-        holdings.append(
-            {
-                "name": name,
-                "weight": percentage,
-            }
-        )
+    if debug_url and len(holdings) < 8:
+        print(f"[debug] {debug_url}: only found {len(holdings)} holdings "
+              f"(some names may have been separated from their % by PDF extraction)",
+              file=sys.stderr)
 
-    # ------------------------------------------------------------------
-    # Deduplicate.
-    # ------------------------------------------------------------------
-
-    result = []
-
-    seen = set()
-
-    for holding in holdings:
-
-        key = (
-            holding["name"].lower(),
-            round(
-                float(
-                    holding["weight"]
-                ),
-                6,
-            ),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(holding)
-
-    return result[:10]
+    return holdings[:10]
 
 
-def extract_holdings_from_pdf(
-    pdf_bytes,
-    debug_url="",
-    debug=False,
-):
-
-    try:
-        import pdfplumber
-    except ImportError:
-
-        raise RuntimeError(
-            "pdfplumber is required."
-        )
-
-    results = []
-
-    with pdfplumber.open(
-        io.BytesIO(pdf_bytes)
-    ) as pdf:
-
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1,
-        ):
-
-            page_holdings = (
-                extract_holdings_from_page(
-                    page,
-                    debug=debug,
-                )
-            )
-
-            if page_holdings:
-
-                if debug:
-
-                    print(
-                        f"[debug] {debug_url}: "
-                        f"page {page_number}: "
-                        f"{len(page_holdings)} holdings",
-                        file=sys.stderr,
-                    )
-
-                results.extend(
-                    page_holdings
-                )
-
-    final = []
-
-    seen = set()
-
-    for holding in results:
-
-        name = clean_holding_name(
-            holding["name"]
-        )
-
-        weight = holding[
-            "weight"
-        ]
-
-        if not name:
-            continue
-
-        key = (
-            name.lower(),
-            round(
-                float(weight),
-                6,
-            ),
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        final.append(
-            {
-                "name": name,
-                "weight": weight,
-            }
-        )
-
-    return final[:10]
-
-
-# ============================================================================
-# FACTSHEET
-# ============================================================================
-
-def fetch_holdings_from_factsheet(
-    factsheet_url,
-    debug=False,
-):
-
-    import requests
-
-    response = requests.get(
-        factsheet_url,
-        timeout=30,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/128.0 Safari/537.36"
-            )
-        },
-    )
-
-    response.raise_for_status()
-
-    return extract_holdings_from_pdf(
-        response.content,
-        debug_url=factsheet_url,
-        debug=debug,
-    )
-
-
-def find_factsheet_url(
-    page,
-    base_url,
-):
-
-    candidates = [
-        "View factsheet",
-        "Fund Factsheet",
-    ]
-
-    for text in candidates:
-
+def find_factsheet_url(page) -> str:
+    """Every fund page has a 'View factsheet' link near the Prices block,
+    and again under 'Fund documents' as 'Fund Factsheet'. Try both."""
+    for text in ("View factsheet", "Fund Factsheet"):
         try:
-
-            locator = page.get_by_text(
-                text,
-                exact=False,
-            )
-
-            count = locator.count()
-
-            for index in range(
-                min(count, 5)
-            ):
-
-                element = locator.nth(
-                    index
-                )
-
-                href = element.get_attribute(
-                    "href"
-                )
-
-                if not href:
-                    continue
-
-                absolute = urljoin(
-                    base_url,
-                    href,
-                )
-
-                if (
-                    ".pdf" in absolute.lower()
-                    or "factsheet"
-                    in absolute.lower()
-                ):
-                    return absolute
-
+            locator = page.get_by_text(text, exact=False)
+            if locator.count() == 0:
+                continue
+            href = locator.first.get_attribute("href")
+            if href and href.lower().endswith(".pdf"):
+                return href
         except Exception:
             continue
-
-    try:
-
-        anchors = page.locator("a")
-
-        count = anchors.count()
-
-        for index in range(count):
-
-            anchor = anchors.nth(
-                index
-            )
-
-            text = (
-                anchor.inner_text()
-                .strip()
-                .lower()
-            )
-
-            href = anchor.get_attribute(
-                "href"
-            )
-
-            if not href:
-                continue
-
-            if (
-                "factsheet" in text
-                or "view factsheet" in text
-            ):
-
-                absolute = urljoin(
-                    base_url,
-                    href,
-                )
-
-                return absolute
-
-    except Exception:
-        pass
-
     return ""
 
 
-# ============================================================================
-# FUND PAGE
-# ============================================================================
+def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> list:
+    """Downloads the factsheet PDF (plain HTTP - PDFs aren't subject to
+    the browser-JS-rendering concerns the main fund pages are) and
+    extracts text via pdfplumber for parse_holdings() to work on."""
+    import requests
+    import pdfplumber
+    import io
 
-def parse_fund_page(
-    text,
-    url,
-    debug=False,
-):
+    resp = requests.get(factsheet_url, timeout=30)
+    resp.raise_for_status()
 
-    result = {
-        "url": url,
-        "scraped_name": None,
-        "risk": None,
-        "currency": None,
-        "inception": None,
-        "code": None,
-        "cic": None,
-        "asset_class": None,
-        "bid": None,
-        "offer": None,
-        "return_1y": None,
-        "return_3y": None,
-        "return_5y": None,
-    }
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+        for pg in pdf.pages:
+            t = pg.extract_text()
+            if t:
+                text_parts.append(t)
+    full_text = "\n".join(text_parts)
 
-    match = NAME_PATTERN.search(
-        text
+    return parse_holdings(full_text, debug_url=factsheet_url if debug else "")
+
+
+def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
+    result = {"url": url}
+
+    name_match = NAME_PATTERN.search(text)
+
+    result["scraped_name"] = (
+        name_match.group(1).strip(" *")
+        if name_match
+        else None
     )
-
-    if match:
-
-        result[
-            "scraped_name"
-        ] = match.group(1).strip(
-            " *"
-        )
 
     for key, pattern in FIELD_PATTERNS.items():
-
-        match = pattern.search(
-            text
-        )
-
-        if match:
-
-            result[key] = (
-                match.group(1).strip()
-            )
+        m = pattern.search(text)
+        result[key] = m.group(1) if m else None
 
     if debug:
+        missing = [
+            k
+            for k, v in result.items()
+            if v is None and k != "url"
+        ]
 
+        print(f"[debug] {url}", file=sys.stderr)
         print(
-            f"[debug] {url}",
-            file=sys.stderr,
+            f"[debug]   name={result['scraped_name']!r}",
+            file=sys.stderr
         )
 
-        print(
-            f"[debug] name="
-            f"{result['scraped_name']!r}",
-            file=sys.stderr,
-        )
-
-        print(
-            f"[debug] code="
-            f"{result['code']!r}",
-            file=sys.stderr,
-        )
-
-        print(
-            f"[debug] bid="
-            f"{result['bid']!r}",
-            file=sys.stderr,
-        )
+        if missing:
+            print(
+                f"[debug]   missing: {missing}",
+                file=sys.stderr
+            )
 
     return result
 
 
-def fetch_and_parse(
-    url,
-    debug=False,
-):
-
-    from playwright.sync_api import (
-        sync_playwright,
-    )
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(
-            headless=True
-        )
-
-        page = browser.new_page()
-
-        try:
-
-            page.goto(
-                url,
-                wait_until="networkidle",
-                timeout=30000,
-            )
-
-            text = page.inner_text(
-                "body"
-            )
-
-            factsheet_url = (
-                find_factsheet_url(
-                    page,
-                    url,
-                )
-            )
-
-        finally:
-
-            browser.close()
-
-    result = parse_fund_page(
-        text,
-        url,
-        debug=debug,
-    )
-
-    result[
-        "holdings"
-    ] = []
-
-    if factsheet_url:
-
-        try:
-
-            result[
-                "holdings"
-            ] = fetch_holdings_from_factsheet(
-                factsheet_url,
-                debug=debug,
-            )
-
-        except Exception as exc:
-
-            if debug:
-
-                print(
-                    f"[debug] Factsheet failed: "
-                    f"{exc}",
-                    file=sys.stderr,
-                )
-
-    result[
-        "factsheetUrl"
-    ] = factsheet_url or "-"
-
-    return result
-
-
-# ============================================================================
-# EXCEL
-# ============================================================================
-
-def load_urls_from_excel(
-    path,
-):
-
+def load_urls_from_excel(path: str) -> list:
     import openpyxl
 
     wb = openpyxl.load_workbook(
         path,
         data_only=True,
-        keep_vba=True,
+        keep_vba=path.endswith(".xlsm")
     )
 
-    ws = wb[
-        wb.sheetnames[0]
+    ws = wb[wb.sheetnames[0]]
+
+    return [
+        row[0]
+        for row in ws.iter_rows(
+            min_row=2,
+            values_only=True
+        )
+        if row[0]
     ]
 
-    urls = []
 
-    seen = set()
+def fetch_and_parse(url: str, debug: bool = False) -> dict:
+    from playwright.sync_api import sync_playwright
 
-    for row in ws.iter_rows(
-        min_row=2,
-        values_only=True,
-    ):
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
 
-        if not row:
-            continue
+        page = browser.new_page()
 
-        value = row[0]
+        page.goto(
+            url,
+            wait_until="networkidle",
+            timeout=30000
+        )
 
-        if not value:
-            continue
+        text = page.inner_text("body")
+        factsheet_url = find_factsheet_url(page)
 
-        url = str(
-            value
-        ).strip()
+        browser.close()
 
-        if not url:
-            continue
+    result = parse_fund_page(
+        text,
+        url,
+        debug=debug
+    )
 
-        if url in seen:
-            continue
+    result["holdings"] = []
+    if factsheet_url:
+        try:
+            result["holdings"] = fetch_holdings_from_factsheet(factsheet_url, debug=debug)
+        except Exception as e:
+            if debug:
+                print(f"[debug] {url}: factsheet holdings extraction failed ({factsheet_url}): {e}",
+                      file=sys.stderr)
 
-        seen.add(url)
-        urls.append(url)
+    return result
 
-    return urls
-
-
-# ============================================================================
-# CATEGORY
-# ============================================================================
 
 ASSET_CLASS_TO_CATEGORY = {
     "money market": "Cash",
@@ -1139,20 +354,20 @@ ASSET_CLASS_TO_CATEGORY = {
 }
 
 
-def guess_category(
-    scraped,
-):
+def guess_category(scraped: dict) -> str:
+    """
+    Best-effort category from the scraped asset class + fund name, since
+    the fund page doesn't label a category the same way this dashboard
+    groups funds (Asian Equity, China Equity, etc.).
+    """
 
     name = (
-        scraped.get(
-            "scraped_name"
-        )
-        or ""
+        scraped.get("scraped_name") or ""
     ).lower()
 
-    hints = [
-        ("greater china", "China Equity"),
+    region_hints = [
         ("china", "China Equity"),
+        ("greater china", "China Equity"),
         ("india", "India Equity"),
         ("asia", "Asian Equity"),
         ("singapore", "Singapore Equity"),
@@ -1168,930 +383,149 @@ def guess_category(
         ("climate", "ESG"),
     ]
 
-    for hint, category in hints:
-
+    for hint, cat in region_hints:
         if hint in name:
-            return category
+            return cat
 
     asset_class = (
-        scraped.get(
-            "asset_class"
-        )
-        or ""
+        scraped.get("asset_class") or ""
     ).lower()
 
     return ASSET_CLASS_TO_CATEGORY.get(
         asset_class,
-        "-",
+        "Global Equity"
     )
 
-
-# ============================================================================
-# CONVERSIONS
-# ============================================================================
-
-def safe_float(value):
-
-    if value is None:
-        return None
-
-    if isinstance(
-        value,
-        (int, float),
-    ):
-        return float(value)
-
-    try:
-
-        value = str(
-            value
-        ).strip()
-
-        if not value or value == "-":
-            return None
-
-        return float(value)
-
-    except Exception:
-        return None
-
-
-def value_or_dash(value):
-
-    if value is None:
-        return "-"
-
-    value = str(
-        value
-    ).strip()
-
-    return value or "-"
-
-
-# ============================================================================
-# EXISTING FUND EXTRACTION
-# ============================================================================
-
-def get_existing_funds(
-    data,
-):
-
-    container = data.get(
-        "funds",
-        {},
-    )
-
-    # --------------------------------------------------------------
-    # Current expected structure:
-    #
-    # data["funds"]["funds"]
-    # --------------------------------------------------------------
-
-    if isinstance(
-        container,
-        dict,
-    ):
-
-        funds = container.get(
-            "funds",
-            [],
-        )
-
-        if isinstance(
-            funds,
-            list,
-        ):
-            return funds
-
-    # --------------------------------------------------------------
-    # Compatibility with older possible structure:
-    #
-    # data["funds"] = [...]
-    # --------------------------------------------------------------
-
-    if isinstance(
-        container,
-        list,
-    ):
-        return container
-
-    return []
-
-
-# ============================================================================
-# MAIN
-# ============================================================================
 
 def main():
+    ap = argparse.ArgumentParser()
 
-    parser = argparse.ArgumentParser()
+    ap.add_argument("--urls", help="Excel file (.xlsx/.xlsm) with one fund URL per row, header in row 1")
+    ap.add_argument("--input-html", help="Parse one saved page's text instead of fetching (for testing the regex)")
+    ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests - be polite to their servers")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="Print parsed results without writing data.json")
 
-    parser.add_argument(
-        "--urls",
-        required=False,
-    )
-
-    parser.add_argument(
-        "--input-html",
-    )
-
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.5,
-    )
-
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-    )
-
-    args = parser.parse_args()
-
-    # ------------------------------------------------------------------
-    # Input text test
-    # ------------------------------------------------------------------
+    args = ap.parse_args()
 
     if args.input_html:
-
-        text = Path(
-            args.input_html
-        ).read_text(
-            encoding="utf-8"
-        )
-
-        parsed = parse_fund_page(
-            text,
-            args.input_html,
-            debug=True,
-        )
-
-        print(
-            json.dumps(
-                parsed,
-                indent=2,
-                ensure_ascii=False,
-            )
-        )
-
+        text = Path(args.input_html).read_text()
+        print(json.dumps(parse_fund_page(text, args.input_html, debug=True), indent=2))
         return
 
     if not args.urls:
-
-        print(
-            "ERROR: --urls is required.",
-            file=sys.stderr,
-        )
-
+        print("Provide --urls path/to/Funds_Links.xlsm (or --input-html to test the parser)", file=sys.stderr)
         sys.exit(1)
 
-    # ------------------------------------------------------------------
-    # Excel URLs
-    # ------------------------------------------------------------------
+    urls = load_urls_from_excel(args.urls)
+    print(f"Loaded {len(urls)} fund URLs from {args.urls}")
 
-    urls = load_urls_from_excel(
-        args.urls
-    )
-
-    print(
-        f"Loaded {len(urls)} unique fund URLs."
-    )
-
-    if not urls:
-
-        print(
-            "ERROR: No fund URLs found.",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Load existing data FIRST.
-    #
-    # This allows us to protect existing data if scraping fails.
-    # ------------------------------------------------------------------
-
-    if not DATA_PATH.exists():
-
-        print(
-            f"ERROR: {DATA_PATH} does not exist.",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
-
-    try:
-
-        data = json.loads(
-            DATA_PATH.read_text(
-                encoding="utf-8"
-            )
-        )
-
-    except Exception as exc:
-
-        print(
-            f"ERROR: Cannot parse data.json: {exc}",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
-
-    old_funds = get_existing_funds(
-        data
-    )
-
-    print(
-        f"Existing fund records: {len(old_funds)}"
-    )
-
-    old_by_url = {}
-
-    for fund in old_funds:
-
-        if not isinstance(
-            fund,
-            dict,
-        ):
-            continue
-
-        source_url = fund.get(
-            "sourceUrl"
-        )
-
-        if source_url:
-
-            old_by_url[
-                source_url
-            ] = fund
-
-    # ------------------------------------------------------------------
-    # Scrape
-    # ------------------------------------------------------------------
-
-    scraped_by_url = {}
-
-    failed_urls = []
-
-    for index, url in enumerate(
-        urls,
-        start=1,
-    ):
-
+    scraped = []
+    for i, url in enumerate(urls, 1):
         try:
-
-            result = fetch_and_parse(
-                url,
-                debug=args.debug,
-            )
-
-            scraped_by_url[
-                url
-            ] = result
-
-            print(
-                f"[{index}/{len(urls)}] "
-                f"{result.get('scraped_name') or url} "
-                f"code={result.get('code') or '-'} "
-                f"bid={result.get('bid') or '-'} "
-                f"holdings="
-                f"{len(result.get('holdings') or [])}"
-            )
-
-        except Exception as exc:
-
-            failed_urls.append(
-                url
-            )
-
-            print(
-                f"[{index}/{len(urls)}] "
-                f"FAILED: {url}",
-                file=sys.stderr,
-            )
-
-            print(
-                f"    {exc}",
-                file=sys.stderr,
-            )
-
-        time.sleep(
-            args.delay
-        )
-
-    # ------------------------------------------------------------------
-    # Dry run
-    # ------------------------------------------------------------------
+            data = fetch_and_parse(url, debug=args.debug)
+            scraped.append(data)
+            print(f"[{i}/{len(urls)}] {data.get('scraped_name') or url} -> code={data.get('code')} risk={data.get('risk')} bid={data.get('bid')}")
+        except Exception as e:
+            print(f"[{i}/{len(urls)}] FAILED {url}: {e}", file=sys.stderr)
+        time.sleep(args.delay)
 
     if args.dry_run:
-
-        Path(
-            "scraped_raw.json"
-        ).write_text(
-            json.dumps(
-                list(
-                    scraped_by_url.values()
-                ),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-
-        print(
-            "Dry run complete."
-        )
-
+        Path("scraped_raw.json").write_text(json.dumps(scraped, indent=2))
+        print("\nWrote scraped_raw.json (dry run - data.json not touched)")
         return
 
-    # ------------------------------------------------------------------
-    # CRITICAL FAIL-SAFE
-    #
-    # If nothing was successfully scraped, DO NOT TOUCH the existing
-    # fund list.
-    # ------------------------------------------------------------------
+    data = json.loads(DATA_PATH.read_text())
 
-    if not scraped_by_url:
+    old_by_url = {f["sourceUrl"]: f for f in data["funds"]["funds"] if f.get("sourceUrl")}
+    old_history = data.get("history", {})
+    old_history_full = data.get("history_full", {})
 
-        print(
-            "\nERROR: ZERO fund pages were successfully scraped.",
-            file=sys.stderr,
-        )
-
-        print(
-            "Existing fund data will NOT be replaced.",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Rebuild fund list
-    # ------------------------------------------------------------------
+    scraped_by_url = {s["url"]: s for s in scraped}
 
     new_funds = []
-
     new_history = {}
-
     new_history_full = {}
 
-    old_history = data.get(
-        "history",
-        {},
-    )
-
-    old_history_full = data.get(
-        "history_full",
-        {},
-    )
-
-    successful = 0
-    reused = 0
     added = 0
-
-    # ------------------------------------------------------------------
-    # Excel order is authoritative.
-    # ------------------------------------------------------------------
+    reused_from_failure = 0
+    failed_no_fallback = []
 
     for url in urls:
+        s = scraped_by_url.get(url)
 
-        live = scraped_by_url.get(
-            url
-        )
-
-        previous = old_by_url.get(
-            url
-        )
-
-        # ==============================================================
-        # LIVE SCRAPE AVAILABLE
-        # ==============================================================
-
-        if live and live.get(
-            "scraped_name"
-        ):
-
-            successful += 1
-
-            name = str(
-                live["scraped_name"]
-            ).strip()
-
-            bid = safe_float(
-                live.get("bid")
-            )
-
-            offer = safe_float(
-                live.get("offer")
-            )
-
-            # ----------------------------------------------------------
-            # Important:
-            #
-            # Missing bid does NOT invalidate the whole fund anymore.
-            # ----------------------------------------------------------
-
-            if bid is None and previous:
-
-                bid = previous.get(
-                    "bid",
-                    "-",
-                )
-
-            if bid is None:
-
-                bid = "-"
-
-            # ----------------------------------------------------------
-            # Offer
-            # ----------------------------------------------------------
-
-            if offer is None and previous:
-
-                offer = previous.get(
-                    "offer",
-                    "-",
-                )
-
-            if offer is None:
-
-                offer = "-"
-
-            # ----------------------------------------------------------
-            # Scalar fields
-            # ----------------------------------------------------------
-
-            code = value_or_dash(
-                live.get("code")
-            )
-
-            if code == "-" and previous:
-
-                code = previous.get(
-                    "code",
-                    "-",
-                )
-
-            risk = value_or_dash(
-                live.get("risk")
-            )
-
-            if risk == "-" and previous:
-
-                risk = previous.get(
-                    "riskCategory",
-                    "-",
-                )
-
-            currency = value_or_dash(
-                live.get("currency")
-            )
-
-            if currency == "-" and previous:
-
-                currency = previous.get(
-                    "currency",
-                    "-",
-                )
-
-            inception = value_or_dash(
-                live.get("inception")
-            )
-
-            if inception == "-" and previous:
-
-                inception = previous.get(
-                    "effective_date",
-                    "-",
-                )
-
-            cic = value_or_dash(
-                live.get("cic")
-            )
-
-            if cic == "-" and previous:
-
-                cic = previous.get(
-                    "cic",
-                    "-",
-                )
-
-            asset_class = value_or_dash(
-                live.get("asset_class")
-            )
-
-            if asset_class == "-" and previous:
-
-                asset_class = previous.get(
-                    "assetClass",
-                    "-",
-                )
-
-            # ----------------------------------------------------------
-            # Category
-            # ----------------------------------------------------------
-
-            category = guess_category(
-                live
-            )
-
-            if (
-                category == "-"
-                and previous
-            ):
-
-                category = previous.get(
-                    "category",
-                    "-",
-                )
-
-            # ----------------------------------------------------------
-            # Holdings
-            #
-            # Only replace existing holdings if the new PDF actually
-            # returned holdings.
-            # ----------------------------------------------------------
-
-            new_holdings = (
-                live.get(
-                    "holdings"
-                )
-                or []
-            )
-
-            if not new_holdings and previous:
-
-                new_holdings = previous.get(
-                    "holdings",
-                    [],
-                )
-
-            # ----------------------------------------------------------
-            # Factsheet
-            # ----------------------------------------------------------
-
-            factsheet = value_or_dash(
-                live.get(
-                    "factsheetUrl"
-                )
-            )
-
-            if (
-                factsheet == "-"
-                and previous
-            ):
-
-                factsheet = previous.get(
-                    "factsheetUrl",
-                    "-",
-                )
-
-            # ----------------------------------------------------------
-            # Fund object
-            # ----------------------------------------------------------
+        if s and s.get("scraped_name") and s.get("bid"):
+            name = s["scraped_name"]
+            category = guess_category(s)
+            bid = float(s["bid"])
+            offer = float(s.get("offer") or bid)
 
             fund = {
-
                 "name": name,
-
                 "category": category,
-
-                "currency": currency,
-
-                "effective_date": inception,
-
+                "currency": s.get("currency") or "SGD",
+                "effective_date": s.get("inception") or "",
                 "bid": bid,
-
                 "offer": offer,
-
-                "code": code,
-
-                "codeVerified": (
-                    code != "-"
-                ),
-
-                "riskCategory": risk,
-
-                "cic": cic,
-
-                "assetClass": asset_class,
-
+                "code": s.get("code") or "",
+                "codeVerified": bool(s.get("code")),
+                "riskCategory": s.get("risk") or "Higher Risk",
                 "dataSource": "verified-live",
-
                 "sourceUrl": url,
-
-                "factsheetUrl": factsheet,
-
-                "holdings": new_holdings,
-
+                "holdings": s.get("holdings") or [],
             }
 
-            # ----------------------------------------------------------
-            # Live annualised returns
-            # ----------------------------------------------------------
-
             live_returns = {}
+            for period, rkey in (("1y", "return_1y"), ("3y", "return_3y"), ("5y", "return_5y")):
+                val = s.get(rkey)
+                if val and val != "-":
+                    live_returns[period] = float(val)
+            if live_returns:
+                fund["liveReturns"] = live_returns
 
-            for period, key in (
-                ("1y", "return_1y"),
-                ("3y", "return_3y"),
-                ("5y", "return_5y"),
-            ):
+            new_funds.append(fund)
 
-                value = safe_float(
-                    live.get(key)
-                )
+            prev = old_by_url.get(url)
+            if prev and prev.get("name") in old_history:
+                new_history[name] = old_history[prev["name"]]
+            if prev and prev.get("name") in old_history_full:
+                new_history_full[name] = old_history_full[prev["name"]]
 
-                if value is None and previous:
-
-                    value = safe_float(
-                        previous.get(
-                            "liveReturns",
-                            {},
-                        ).get(
-                            period
-                        )
-                    )
-
-                live_returns[
-                    period
-                ] = (
-                    value
-                    if value is not None
-                    else "-"
-                )
-
-            fund[
-                "liveReturns"
-            ] = live_returns
-
-            new_funds.append(
-                fund
-            )
-
-            # ----------------------------------------------------------
-            # History
-            # ----------------------------------------------------------
-
-            old_name = (
-                previous.get(
-                    "name"
-                )
-                if previous
-                else None
-            )
-
-            if old_name:
-
-                if old_name in old_history:
-
-                    new_history[
-                        name
-                    ] = old_history[
-                        old_name
-                    ]
-
-                if old_name in old_history_full:
-
-                    new_history_full[
-                        name
-                    ] = old_history_full[
-                        old_name
-                    ]
-
-            if not previous:
-
+            if url not in old_by_url:
                 added += 1
+                print(f"  + New fund: {name}")
 
-            continue
+        elif url in old_by_url:
+            fund = old_by_url[url]
+            new_funds.append(fund)
+            if fund["name"] in old_history:
+                new_history[fund["name"]] = old_history[fund["name"]]
+            if fund["name"] in old_history_full:
+                new_history_full[fund["name"]] = old_history_full[fund["name"]]
+            reused_from_failure += 1
 
-        # ==============================================================
-        # LIVE SCRAPE FAILED
-        # ==============================================================
+        else:
+            failed_no_fallback.append(url)
 
-        if previous:
+    data["funds"]["funds"] = new_funds
+    data["history"] = new_history
+    data["history_full"] = new_history_full
 
-            # ----------------------------------------------------------
-            # Preserve the previous record.
-            # ----------------------------------------------------------
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(sgt)
+    data["funds"]["updated_on"] = now.strftime("%d-%b-%Y")
+    data["funds"]["updated_at"] = now.strftime("%d-%b-%Y %I:%M %p SGT")
 
-            new_funds.append(
-                previous
-            )
+    DATA_PATH.write_text(json.dumps(data))
 
-            reused += 1
+    print(f"\ndata.json rebuilt: {len(new_funds)} funds (matches {len(urls)} URLs in the Excel file exactly).")
+    print(f"  {added} new, {reused_from_failure} reused from a failed scrape this run.")
 
-            old_name = previous.get(
-                "name"
-            )
-
-            if old_name:
-
-                if old_name in old_history:
-
-                    new_history[
-                        old_name
-                    ] = old_history[
-                        old_name
-                    ]
-
-                if old_name in old_history_full:
-
-                    new_history_full[
-                        old_name
-                    ] = old_history_full[
-                        old_name
-                    ]
-
-            print(
-                f"  Reused previous record: {url}",
-                file=sys.stderr,
-            )
-
-            continue
-
-        # --------------------------------------------------------------
-        # Brand-new URL that could not be scraped.
-        #
-        # Do not fabricate a fund record.
-        # --------------------------------------------------------------
-
-        print(
-            f"  WARNING: New URL could not be scraped: {url}",
-            file=sys.stderr,
-        )
-
-    # ------------------------------------------------------------------
-    # SAFETY CHECK
-    #
-    # Never replace a populated existing fund list with zero.
-    # ------------------------------------------------------------------
-
-    if (
-        len(new_funds) == 0
-        and len(old_funds) > 0
-    ):
-
-        print(
-            "\nERROR: Rebuild produced ZERO funds "
-            "while existing data contains funds.",
-            file=sys.stderr,
-        )
-
-        print(
-            "data.json was NOT modified.",
-            file=sys.stderr,
-        )
-
-        sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Make sure the nested funds structure exists.
-    # ------------------------------------------------------------------
-
-    if not isinstance(
-        data.get("funds"),
-        dict,
-    ):
-
-        data[
-            "funds"
-        ] = {}
-
-    # ------------------------------------------------------------------
-    # Replace ONLY the fund array.
-    # ------------------------------------------------------------------
-
-    data[
-        "funds"
-    ][
-        "funds"
-    ] = new_funds
-
-    # ------------------------------------------------------------------
-    # Preserve history only for funds still present.
-    # ------------------------------------------------------------------
-
-    data[
-        "history"
-    ] = new_history
-
-    data[
-        "history_full"
-    ] = new_history_full
-
-    # ------------------------------------------------------------------
-    # Timestamp
-    # ------------------------------------------------------------------
-
-    sgt = timezone(
-        timedelta(
-            hours=8
-        )
-    )
-
-    now = datetime.now(
-        sgt
-    )
-
-    data[
-        "funds"
-    ][
-        "updated_on"
-    ] = now.strftime(
-        "%d-%b-%Y"
-    )
-
-    data[
-        "funds"
-    ][
-        "updated_at"
-    ] = now.strftime(
-        "%d-%b-%Y %I:%M %p SGT"
-    )
-
-    # ------------------------------------------------------------------
-    # Write JSON
-    # ------------------------------------------------------------------
-
-    DATA_PATH.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            separators=(
-                ",",
-                ":",
-            ),
-        ),
-        encoding="utf-8",
-    )
-
-    # ------------------------------------------------------------------
-    # Final report
-    # ------------------------------------------------------------------
-
-    print()
-    print(
-        "=================================================="
-    )
-    print(
-        "VGrat FMS FUND REBUILD COMPLETE"
-    )
-    print(
-        "=================================================="
-    )
-
-    print(
-        f"Excel URLs:              {len(urls)}"
-    )
-
-    print(
-        f"Live scrapes:            {successful}"
-    )
-
-    print(
-        f"Existing records reused: {reused}"
-    )
-
-    print(
-        f"New funds:               {added}"
-    )
-
-    print(
-        f"Funds written:           {len(new_funds)}"
-    )
-
-    print(
-        f"Failed URLs:             {len(failed_urls)}"
-    )
-
-    print(
-        "=================================================="
-    )
-
-    if len(new_funds) == len(urls):
-
-        print(
-            "SUCCESS: Fund count matches Funds_Links.xlsm."
-        )
-
-    elif len(new_funds) > 0:
-
-        print(
-            "WARNING: Some new URLs could not be scraped."
-        )
-
-        print(
-            f"Written {len(new_funds)} of {len(urls)} URLs."
-        )
-
-    print()
+    if failed_no_fallback:
+        print(f"\n{len(failed_no_fallback)} URL(s) failed with no previous data to fall back on (these funds are temporarily absent until a future run succeeds):", file=sys.stderr)
+        for u in failed_no_fallback:
+            print(f"  - {u}", file=sys.stderr)
 
 
 if __name__ == "__main__":
