@@ -64,19 +64,29 @@ removed from the Excel file, are absent from the result.
 
 HISTORY / HOLDINGS
 ------------------
-Synthetic holdings and synthetic price history are intentionally NOT
-generated.
-
-  - holdings is stored as an empty list unless real holdings data is
-    available elsewhere in the future.
-  - Existing historical price data is preserved for a fund when it already
-    exists in data.json.
+Price history: synthetic history is intentionally NOT generated.
+  - Existing historical price data is preserved for a fund when it
+    already exists in data.json.
   - New funds do not receive fabricated historical price data.
-  - No random-walk or illustrative holdings data is generated.
+  - No random-walk history is generated.
+
+Holdings: REAL Top 10 Holdings are extracted from each fund's factsheet
+PDF (linked from its own page as "View factsheet"). No fabricated
+holdings are used.
+  - A fund with no factsheet link, or whose factsheet PDF isn't in the
+    expected "Top Holdings" format, gets an empty holdings list rather
+    than a guess.
+  - PDF text extraction can separate a holding's name from its
+    percentage when the source PDF uses a multi-column layout (verified
+    against a real factsheet: the 9th/10th entries can come through as a
+    bare percentage with no adjacent name). Rather than guess which
+    nearby text might be the missing name, those entries are simply
+    dropped - some funds may show 7-9 real holdings instead of a full
+    10. See parse_holdings() for details.
 
 USAGE
 -----
-    pip install playwright openpyxl
+    pip install playwright openpyxl pdfplumber requests
     playwright install chromium
     python scripts/scrape_funds.py --urls Funds_Links.xlsm
 
@@ -141,26 +151,104 @@ FIELD_PATTERNS = {
 }
 
 
-# The <h1> on each page renders as "PRULink <rest of name>".
-#
-# NOTE:
-# Earlier version of this pattern required literal "#" and "**"
-# markdown-style markers. Those were artifacts of how Claude's own
-# fetch tool rendered pages as markdown and don't exist in Playwright's
-# plain page.inner_text() output.
-#
-# Real rendered text is just:
-#
-#   PRULink ActiveInvest Portfolio - Moderate (Accumulation)
-#
-# on its own line, with no symbols.
-#
-# This matches the first "PRULink ..." or "PRUPrime ..." occurrence,
-# which is reliably the page's H1 title.
 NAME_PATTERN = re.compile(
     r"\b(PRU(?:Link|Prime)\s+[^\n]+)",
     re.I
 )
+
+# Matches the block of text between a "Top Holdings" / "Top 10 Holdings"
+# heading and whatever comes after it (a footnote "Source:" line, or the
+# next section like "Sector Allocation"). Handles the optional footnote
+# digit Prudential appends (e.g. "Top 10 Holdings3").
+HOLDINGS_BLOCK_PATTERN = re.compile(
+    r"Top (?:10 )?Holdings\d*\s*\n(.*?)"
+    r"(?:\n\d*Source|\nSector Allocation|\nCountry Allocation|\nAsset Allocation|\Z)",
+    re.S | re.I
+)
+
+# Within that block, a well-formed line is "NAME  X.X%" on one line.
+HOLDING_LINE_PATTERN = re.compile(r"^(.+?)\s+([\d.]+)\s*%\s*$")
+
+
+def parse_holdings(text: str, debug_url: str = "") -> list:
+    """
+    Extracts real Top 10 Holdings from a factsheet's extracted text.
+
+    KNOWN LIMITATION: PDF text extraction linearizes what's really a
+    multi-column layout, which sometimes separates the last 1-2 holdings'
+    names from their percentages (verified against a real factsheet - the
+    9th/10th entries came through as bare "2.9%" / "2.8%" lines with their
+    actual company names having been pushed elsewhere in the extracted
+    text, mixed in with unrelated sidebar fields). Rather than guess which
+    nearby all-caps text might be the missing name - which risks attaching
+    a WRONG name to a real number - this only returns holdings where the
+    name and percentage were adjacent in the source text. That means some
+    funds may show 7-9 real holdings instead of a full 10; that's a
+    genuine data gap, not a bug to "fix" by fabricating a name.
+    """
+    block_match = HOLDINGS_BLOCK_PATTERN.search(text)
+    if not block_match:
+        return []
+
+    holdings = []
+    for line in block_match.group(1).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = HOLDING_LINE_PATTERN.match(line)
+        if not m:
+            continue
+        name, pct = m.group(1).strip(), float(m.group(2))
+        # A bare percentage with no real name attached (see docstring) -
+        # skip rather than fabricate.
+        if not name or re.match(r"^[\d.]+$", name):
+            continue
+        holdings.append({"name": name, "weight": pct})
+
+    if debug_url and len(holdings) < 8:
+        print(f"[debug] {debug_url}: only found {len(holdings)} holdings "
+              f"(some names may have been separated from their % by PDF extraction)",
+              file=sys.stderr)
+
+    return holdings[:10]
+
+
+def find_factsheet_url(page) -> str:
+    """Every fund page has a 'View factsheet' link near the Prices block,
+    and again under 'Fund documents' as 'Fund Factsheet'. Try both."""
+    for text in ("View factsheet", "Fund Factsheet"):
+        try:
+            locator = page.get_by_text(text, exact=False)
+            if locator.count() == 0:
+                continue
+            href = locator.first.get_attribute("href")
+            if href and href.lower().endswith(".pdf"):
+                return href
+        except Exception:
+            continue
+    return ""
+
+
+def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> list:
+    """Downloads the factsheet PDF (plain HTTP - PDFs aren't subject to
+    the browser-JS-rendering concerns the main fund pages are) and
+    extracts text via pdfplumber for parse_holdings() to work on."""
+    import requests
+    import pdfplumber
+    import io
+
+    resp = requests.get(factsheet_url, timeout=30)
+    resp.raise_for_status()
+
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+        for pg in pdf.pages:
+            t = pg.extract_text()
+            if t:
+                text_parts.append(t)
+    full_text = "\n".join(text_parts)
+
+    return parse_holdings(full_text, debug_url=factsheet_url if debug else "")
 
 
 def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
@@ -236,14 +324,26 @@ def fetch_and_parse(url: str, debug: bool = False) -> dict:
         )
 
         text = page.inner_text("body")
+        factsheet_url = find_factsheet_url(page)
 
         browser.close()
 
-    return parse_fund_page(
+    result = parse_fund_page(
         text,
         url,
         debug=debug
     )
+
+    result["holdings"] = []
+    if factsheet_url:
+        try:
+            result["holdings"] = fetch_holdings_from_factsheet(factsheet_url, debug=debug)
+        except Exception as e:
+            if debug:
+                print(f"[debug] {url}: factsheet holdings extraction failed ({factsheet_url}): {e}",
+                      file=sys.stderr)
+
+    return result
 
 
 ASSET_CLASS_TO_CATEGORY = {
@@ -300,186 +400,48 @@ def guess_category(scraped: dict) -> str:
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument(
-        "--urls",
-        help=(
-            "Excel file (.xlsx/.xlsm) with one fund URL per row, "
-            "header in row 1"
-        )
-    )
-
-    ap.add_argument(
-        "--input-html",
-        help=(
-            "Parse one saved page's text instead of fetching "
-            "(for testing the regex)"
-        )
-    )
-
-    ap.add_argument(
-        "--delay",
-        type=float,
-        default=1.5,
-        help=(
-            "Seconds between requests - be polite to their servers"
-        )
-    )
-
-    ap.add_argument(
-        "--debug",
-        action="store_true"
-    )
-
-    ap.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Print parsed results without writing data.json"
-        )
-    )
+    ap.add_argument("--urls", help="Excel file (.xlsx/.xlsm) with one fund URL per row, header in row 1")
+    ap.add_argument("--input-html", help="Parse one saved page's text instead of fetching (for testing the regex)")
+    ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests - be polite to their servers")
+    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="Print parsed results without writing data.json")
 
     args = ap.parse_args()
 
-    # ------------------------------------------------------------
-    # TEST MODE
-    # ------------------------------------------------------------
-
     if args.input_html:
-        text = Path(
-            args.input_html
-        ).read_text()
-
-        print(
-            json.dumps(
-                parse_fund_page(
-                    text,
-                    args.input_html,
-                    debug=True
-                ),
-                indent=2
-            )
-        )
-
+        text = Path(args.input_html).read_text()
+        print(json.dumps(parse_fund_page(text, args.input_html, debug=True), indent=2))
         return
-
-    # ------------------------------------------------------------
-    # VALIDATE ARGUMENTS
-    # ------------------------------------------------------------
 
     if not args.urls:
-        print(
-            "Provide --urls path/to/Funds_Links.xlsm "
-            "(or --input-html to test the parser)",
-            file=sys.stderr
-        )
-
+        print("Provide --urls path/to/Funds_Links.xlsm (or --input-html to test the parser)", file=sys.stderr)
         sys.exit(1)
 
-    # ------------------------------------------------------------
-    # LOAD URLS
-    # ------------------------------------------------------------
-
     urls = load_urls_from_excel(args.urls)
-
-    print(
-        f"Loaded {len(urls)} fund URLs from {args.urls}"
-    )
-
-    # ------------------------------------------------------------
-    # SCRAPE
-    # ------------------------------------------------------------
+    print(f"Loaded {len(urls)} fund URLs from {args.urls}")
 
     scraped = []
-
     for i, url in enumerate(urls, 1):
         try:
-            data = fetch_and_parse(
-                url,
-                debug=args.debug
-            )
-
+            data = fetch_and_parse(url, debug=args.debug)
             scraped.append(data)
-
-            print(
-                f"[{i}/{len(urls)}] "
-                f"{data.get('scraped_name') or url} "
-                f"-> "
-                f"code={data.get('code')} "
-                f"risk={data.get('risk')} "
-                f"bid={data.get('bid')}"
-            )
-
+            print(f"[{i}/{len(urls)}] {data.get('scraped_name') or url} -> code={data.get('code')} risk={data.get('risk')} bid={data.get('bid')}")
         except Exception as e:
-            print(
-                f"[{i}/{len(urls)}] FAILED {url}: {e}",
-                file=sys.stderr
-            )
-
+            print(f"[{i}/{len(urls)}] FAILED {url}: {e}", file=sys.stderr)
         time.sleep(args.delay)
 
-    # ------------------------------------------------------------
-    # DRY RUN
-    # ------------------------------------------------------------
-
     if args.dry_run:
-        Path(
-            "scraped_raw.json"
-        ).write_text(
-            json.dumps(
-                scraped,
-                indent=2
-            )
-        )
-
-        print(
-            "\nWrote scraped_raw.json "
-            "(dry run - data.json not touched)"
-        )
-
+        Path("scraped_raw.json").write_text(json.dumps(scraped, indent=2))
+        print("\nWrote scraped_raw.json (dry run - data.json not touched)")
         return
 
-    # ------------------------------------------------------------
-    # LOAD EXISTING DATA
-    # ------------------------------------------------------------
+    data = json.loads(DATA_PATH.read_text())
 
-    data = json.loads(
-        DATA_PATH.read_text()
-    )
+    old_by_url = {f["sourceUrl"]: f for f in data["funds"]["funds"] if f.get("sourceUrl")}
+    old_history = data.get("history", {})
+    old_history_full = data.get("history_full", {})
 
-    # Old funds keyed by URL.
-    #
-    # Used only as a fallback when today's scrape of that same URL
-    # fails, so a transient network hiccup doesn't make a fund vanish
-    # for one run.
-
-    old_by_url = {
-        f["sourceUrl"]: f
-        for f in data["funds"]["funds"]
-        if f.get("sourceUrl")
-    }
-
-    # Existing real history is preserved.
-    #
-    # No synthetic history is created.
-
-    old_history = data.get(
-        "history",
-        {}
-    )
-
-    old_history_full = data.get(
-        "history_full",
-        {}
-    )
-
-    scraped_by_url = {
-        s["url"]: s
-        for s in scraped
-    }
-
-    # ------------------------------------------------------------
-    # REBUILD FUND LIST
-    # ------------------------------------------------------------
+    scraped_by_url = {s["url"]: s for s in scraped}
 
     new_funds = []
     new_history = {}
@@ -490,275 +452,80 @@ def main():
     failed_no_fallback = []
 
     for url in urls:
-
         s = scraped_by_url.get(url)
 
-        # --------------------------------------------------------
-        # SUCCESSFUL SCRAPE
-        # --------------------------------------------------------
-
-        if (
-            s
-            and s.get("scraped_name")
-            and s.get("bid")
-        ):
-
+        if s and s.get("scraped_name") and s.get("bid"):
             name = s["scraped_name"]
-
-            category = guess_category(
-                s
-            )
-
-            bid = float(
-                s["bid"]
-            )
-
-            offer = float(
-                s.get("offer")
-                or bid
-            )
+            category = guess_category(s)
+            bid = float(s["bid"])
+            offer = float(s.get("offer") or bid)
 
             fund = {
                 "name": name,
-
                 "category": category,
-
-                "currency": (
-                    s.get("currency")
-                    or "SGD"
-                ),
-
-                "effective_date": (
-                    s.get("inception")
-                    or ""
-                ),
-
+                "currency": s.get("currency") or "SGD",
+                "effective_date": s.get("inception") or "",
                 "bid": bid,
-
                 "offer": offer,
-
-                "code": (
-                    s.get("code")
-                    or ""
-                ),
-
-                "codeVerified": bool(
-                    s.get("code")
-                ),
-
-                "riskCategory": (
-                    s.get("risk")
-                    or "Higher Risk"
-                ),
-
+                "code": s.get("code") or "",
+                "codeVerified": bool(s.get("code")),
+                "riskCategory": s.get("risk") or "Higher Risk",
                 "dataSource": "verified-live",
-
                 "sourceUrl": url,
-
-                # IMPORTANT:
-                # Synthetic holdings have been removed.
-                #
-                # No fake holdings are generated.
-                "holdings": [],
+                "holdings": s.get("holdings") or [],
             }
 
-            # ----------------------------------------------------
-            # LIVE RETURNS
-            # ----------------------------------------------------
-
             live_returns = {}
-
-            for period, rkey in (
-                ("1y", "return_1y"),
-                ("3y", "return_3y"),
-                ("5y", "return_5y"),
-            ):
-
-                val = s.get(
-                    rkey
-                )
-
+            for period, rkey in (("1y", "return_1y"), ("3y", "return_3y"), ("5y", "return_5y")):
+                val = s.get(rkey)
                 if val and val != "-":
-                    live_returns[period] = float(
-                        val
-                    )
-
+                    live_returns[period] = float(val)
             if live_returns:
                 fund["liveReturns"] = live_returns
 
-            new_funds.append(
-                fund
-            )
+            new_funds.append(fund)
 
-            # ----------------------------------------------------
-            # PRESERVE EXISTING REAL HISTORY
-            # ----------------------------------------------------
-            #
-            # IMPORTANT:
-            # No synthetic history is generated.
-            #
-            # If this fund already has history, preserve it.
-            #
-            # If this is a new fund, it simply has no history.
-            # ----------------------------------------------------
-
-            prev = old_by_url.get(
-                url
-            )
-
-            if (
-                prev
-                and prev.get("name") in old_history
-            ):
-                new_history[name] = old_history[
-                    prev["name"]
-                ]
-
-            if (
-                prev
-                and prev.get("name") in old_history_full
-            ):
-                new_history_full[name] = old_history_full[
-                    prev["name"]
-                ]
-
-            # ----------------------------------------------------
-            # NEW FUND
-            # ----------------------------------------------------
+            prev = old_by_url.get(url)
+            if prev and prev.get("name") in old_history:
+                new_history[name] = old_history[prev["name"]]
+            if prev and prev.get("name") in old_history_full:
+                new_history_full[name] = old_history_full[prev["name"]]
 
             if url not in old_by_url:
-
                 added += 1
-
-                print(
-                    f"  + New fund: {name}"
-                )
-
-        # --------------------------------------------------------
-        # SCRAPE FAILED BUT PREVIOUS DATA EXISTS
-        # --------------------------------------------------------
+                print(f"  + New fund: {name}")
 
         elif url in old_by_url:
-
-            # Scrape failed this run but we have a previous good
-            # copy for this exact URL - keep it rather than dropping
-            # the fund.
-
             fund = old_by_url[url]
-
-            new_funds.append(
-                fund
-            )
-
+            new_funds.append(fund)
             if fund["name"] in old_history:
-
-                new_history[
-                    fund["name"]
-                ] = old_history[
-                    fund["name"]
-                ]
-
+                new_history[fund["name"]] = old_history[fund["name"]]
             if fund["name"] in old_history_full:
-
-                new_history_full[
-                    fund["name"]
-                ] = old_history_full[
-                    fund["name"]
-                ]
-
+                new_history_full[fund["name"]] = old_history_full[fund["name"]]
             reused_from_failure += 1
 
-        # --------------------------------------------------------
-        # NEW URL + FAILED SCRAPE
-        # --------------------------------------------------------
-
         else:
-
-            failed_no_fallback.append(
-                url
-            )
-
-    # ------------------------------------------------------------
-    # WRITE REBUILT DATA
-    # ------------------------------------------------------------
+            failed_no_fallback.append(url)
 
     data["funds"]["funds"] = new_funds
-
     data["history"] = new_history
-
     data["history_full"] = new_history_full
 
-    # ------------------------------------------------------------
-    # UPDATE TIMESTAMP
-    # ------------------------------------------------------------
+    from datetime import datetime, timezone, timedelta
+    sgt = timezone(timedelta(hours=8))
+    now = datetime.now(sgt)
+    data["funds"]["updated_on"] = now.strftime("%d-%b-%Y")
+    data["funds"]["updated_at"] = now.strftime("%d-%b-%Y %I:%M %p SGT")
 
-    from datetime import (
-        datetime,
-        timezone,
-        timedelta
-    )
+    DATA_PATH.write_text(json.dumps(data))
 
-    sgt = timezone(
-        timedelta(hours=8)
-    )
-
-    now = datetime.now(
-        sgt
-    )
-
-    data["funds"]["updated_on"] = (
-        now.strftime(
-            "%d-%b-%Y"
-        )
-    )
-
-    data["funds"]["updated_at"] = (
-        now.strftime(
-            "%d-%b-%Y %I:%M %p SGT"
-        )
-    )
-
-    # ------------------------------------------------------------
-    # SAVE
-    # ------------------------------------------------------------
-
-    DATA_PATH.write_text(
-        json.dumps(
-            data
-        )
-    )
-
-    print(
-        f"\ndata.json rebuilt: "
-        f"{len(new_funds)} funds "
-        f"(matches {len(urls)} URLs in the Excel file exactly)."
-    )
-
-    print(
-        f"  {added} new, "
-        f"{reused_from_failure} reused from a failed scrape this run."
-    )
-
-    # ------------------------------------------------------------
-    # REPORT FAILED NEW FUNDS
-    # ------------------------------------------------------------
+    print(f"\ndata.json rebuilt: {len(new_funds)} funds (matches {len(urls)} URLs in the Excel file exactly).")
+    print(f"  {added} new, {reused_from_failure} reused from a failed scrape this run.")
 
     if failed_no_fallback:
-
-        print(
-            f"\n{len(failed_no_fallback)} URL(s) failed "
-            f"with no previous data to fall back on "
-            f"(these funds are temporarily absent until "
-            f"a future run succeeds):",
-            file=sys.stderr
-        )
-
+        print(f"\n{len(failed_no_fallback)} URL(s) failed with no previous data to fall back on (these funds are temporarily absent until a future run succeeds):", file=sys.stderr)
         for u in failed_no_fallback:
-
-            print(
-                f"  - {u}",
-                file=sys.stderr
-            )
+            print(f"  - {u}", file=sys.stderr)
 
 
 if __name__ == "__main__":
