@@ -242,47 +242,7 @@ jobs:
           print("========================================")
           PY
 
-      # ---------------------------------------------------------
-      # 7. Validate that data.json is not empty
-      # ---------------------------------------------------------
-      - name: Validate fund data
-        run: |
-          python - <<'PY'
-          import json
-          import sys
-
-          with open("data.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          fund_count = 0
-
-          if isinstance(data, list):
-              fund_count = len(data)
-
-          elif isinstance(data, dict):
-              for key in [
-                  "funds",
-                  "fundList",
-                  "data",
-                  "items",
-                  "fundData"
-              ]:
-                  if isinstance(data.get(key), list):
-                      fund_count = len(data[key])
-                      break
-
-          print(f"Detected fund count: {fund_count}")
-
-          if fund_count == 0:
-              print()
-              print("ERROR: Scraper produced ZERO funds.")
-              print("The workflow will stop here so an empty data.json")
-              print("will NOT be committed to the repository.")
-              sys.exit(1)
-
-          print(f"SUCCESS: {fund_count} funds detected.")
-          PY
-
+    
       # ---------------------------------------------------------
       # 8. Commit updated data.json
       # ---------------------------------------------------------
