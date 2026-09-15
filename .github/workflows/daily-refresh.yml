@@ -2,7 +2,6 @@ name: Daily fund data refresh
 
 # Runs every day at 8:00am Singapore Time (SGT = UTC+8, so 00:00 UTC),
 # plus can be triggered manually from the Actions tab any time.
-
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -11,254 +10,28 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
-
     steps:
-      # ---------------------------------------------------------
-      # 1. Checkout repository
-      # ---------------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ---------------------------------------------------------
-      # 2. Setup Python
-      # ---------------------------------------------------------
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ---------------------------------------------------------
-      # 3. Install dependencies
-      # ---------------------------------------------------------
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install playwright openpyxl pdfplumber requests
           playwright install --with-deps chromium
 
-      # ---------------------------------------------------------
-      # 4. Verify source files
-      # ---------------------------------------------------------
-      - name: Verify source files
-        run: |
-          echo "========================================"
-          echo "CHECKING PROJECT FILES"
-          echo "========================================"
-
-          echo ""
-          echo "Current directory:"
-          pwd
-
-          echo ""
-          echo "Project files:"
-          ls -lah
-
-          echo ""
-          echo "Scripts:"
-          ls -lah scripts/
-
-          echo ""
-          echo "Funds_Links.xlsm:"
-          if [ -f "Funds_Links.xlsm" ]; then
-            echo "FOUND"
-          else
-            echo "ERROR: Funds_Links.xlsm NOT FOUND"
-            exit 1
-          fi
-
-          echo ""
-          echo "scrape_funds.py:"
-          if [ -f "scripts/scrape_funds.py" ]; then
-            echo "FOUND"
-          else
-            echo "ERROR: scripts/scrape_funds.py NOT FOUND"
-            exit 1
-          fi
-
-      # ---------------------------------------------------------
-      # 5. Run scraper
-      # ---------------------------------------------------------
       - name: Scrape latest fund data
-        run: |
-          python scripts/scrape_funds.py --urls Funds_Links.xlsm
+        run: python scripts/scrape_funds.py --urls Funds_Links.xlsm
 
-      # ---------------------------------------------------------
-      # 6. Inspect generated data.json
-      # ---------------------------------------------------------
-      - name: Inspect generated data.json
-        run: |
-          echo "========================================"
-          echo "DATA.JSON DIAGNOSTIC"
-          echo "========================================"
-
-          if [ ! -f "data.json" ]; then
-            echo "ERROR: data.json was not created!"
-            exit 1
-          fi
-
-          echo ""
-          echo "File size:"
-          wc -c data.json
-
-          echo ""
-          echo "JSON file exists:"
-          ls -lh data.json
-
-          echo ""
-          echo "Parsing JSON..."
-
-          python - <<'PY'
-          import json
-          import sys
-
-          try:
-              with open("data.json", "r", encoding="utf-8") as f:
-                  data = json.load(f)
-          except Exception as e:
-              print("ERROR: Could not parse data.json")
-              print(e)
-              sys.exit(1)
-
-          print("JSON parsed successfully.")
-          print()
-          print("Type:", type(data).__name__)
-
-          # -----------------------------------------------------
-          # Dictionary format
-          # -----------------------------------------------------
-          if isinstance(data, dict):
-
-              print("Top-level keys:")
-              for key in data.keys():
-                  print("  -", key)
-
-              print()
-
-              for key, value in data.items():
-                  if isinstance(value, list):
-                      print(f"{key}: {len(value)} items")
-                  elif isinstance(value, dict):
-                      print(f"{key}: dictionary")
-                  else:
-                      print(f"{key}: {type(value).__name__}")
-
-              print()
-
-              # Check common fund-list property names
-              possible_fund_keys = [
-                  "funds",
-                  "fundList",
-                  "data",
-                  "items",
-                  "fundData"
-              ]
-
-              found_fund_list = False
-
-              for key in possible_fund_keys:
-                  if key in data and isinstance(data[key], list):
-                      found_fund_list = True
-
-                      print("----------------------------------------")
-                      print(f"FUND ARRAY FOUND: {key}")
-                      print(f"FUND COUNT: {len(data[key])}")
-                      print("----------------------------------------")
-
-                      if len(data[key]) > 0:
-                          print()
-                          print("FIRST FUND:")
-                          print(json.dumps(
-                              data[key][0],
-                              indent=2,
-                              ensure_ascii=False
-                          ))
-
-                          if len(data[key]) > 1:
-                              print()
-                              print("SECOND FUND:")
-                              print(json.dumps(
-                                  data[key][1],
-                                  indent=2,
-                                  ensure_ascii=False
-                              ))
-                      else:
-                          print()
-                          print("WARNING: FUND ARRAY IS EMPTY!")
-
-              if not found_fund_list:
-                  print("----------------------------------------")
-                  print("WARNING: NO RECOGNISED FUND ARRAY FOUND")
-                  print("----------------------------------------")
-                  print()
-                  print("Available top-level structure:")
-                  print(json.dumps(
-                      data,
-                      indent=2,
-                      ensure_ascii=False
-                  )[:5000])
-
-          # -----------------------------------------------------
-          # List format
-          # -----------------------------------------------------
-          elif isinstance(data, list):
-
-              print("----------------------------------------")
-              print("DATA.JSON IS A DIRECT ARRAY")
-              print("----------------------------------------")
-
-              print("FUND COUNT:", len(data))
-
-              if len(data) > 0:
-                  print()
-                  print("FIRST FUND:")
-                  print(json.dumps(
-                      data[0],
-                      indent=2,
-                      ensure_ascii=False
-                  ))
-
-                  if len(data) > 1:
-                      print()
-                      print("SECOND FUND:")
-                      print(json.dumps(
-                          data[1],
-                          indent=2,
-                          ensure_ascii=False
-                      ))
-              else:
-                  print()
-                  print("WARNING: DATA ARRAY IS EMPTY!")
-
-          else:
-              print("ERROR: Unexpected JSON structure.")
-              sys.exit(1)
-
-          print()
-          print("========================================")
-          print("END DATA.JSON DIAGNOSTIC")
-          print("========================================")
-          PY
-
-    
-      # ---------------------------------------------------------
-      # 8. Commit updated data.json
-      # ---------------------------------------------------------
       - name: Commit updated data.json
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git add data.json
-
-          if git diff --staged --quiet; then
-            echo "No changes to data.json"
-          else
-            git commit -m "Daily fund data refresh"
-          fi
-
+          git diff --staged --quiet && echo "No changes" || git commit -m "Daily fund data refresh"
           git pull --rebase origin main
-
           git push
