@@ -268,13 +268,53 @@ def _holdings_from_words(words: list, debug_url: str = "") -> list:
     return holdings[:10]
 
 
+TEXT_HOLDINGS_BLOCK_PATTERN = re.compile(
+    r"Top (?:10 )?Holdings\d*\s*\n(.*?)"
+    r"(?:\n\d*Source|\nSector Allocation|\nCountry Allocation|\nAsset Allocation|\Z)",
+    re.S | re.I
+)
+TEXT_HOLDING_ENTRY_PATTERN = re.compile(r"([A-Za-z][^%]*?)\s*(\d+(?:\.\d+)?)\s*%")
+
+
+def _holdings_from_text(text: str, debug_url: str = "") -> list:
+    """Fallback for when a PDF's word-level extraction doesn't behave as
+    expected (verified: this can happen even when the same PDF's flat
+    extract_text() output parses fine, for certain embedded/subset fonts
+    that confuse word-boundary detection but not character-level text
+    extraction). Same rules as the position-based method: accepts 1-10,
+    handles wrapped names by collapsing the block's whitespace before
+    matching, and skips a bare percentage with no adjacent name rather
+    than fabricate one."""
+    block_match = TEXT_HOLDINGS_BLOCK_PATTERN.search(text)
+    if not block_match:
+        return []
+    collapsed = re.sub(r"\s+", " ", block_match.group(1)).strip()
+    holdings = []
+    for name, pct in TEXT_HOLDING_ENTRY_PATTERN.findall(collapsed):
+        name = name.strip(" -\u2022")
+        if name:
+            holdings.append({"name": name, "weight": float(pct)})
+    if debug_url:
+        print(f"[debug] {debug_url}: text-fallback found {len(holdings)} holdings", file=sys.stderr)
+    return holdings[:10]
+
+
 def parse_holdings(pdf, debug_url: str = "") -> list:
     """Tries each page of the factsheet (the holdings table is usually on
     page 1, but this doesn't assume that) and returns the first page that
-    yields any holdings at all."""
+    yields any holdings at all - preferring the position-based method
+    (more accurate when a sidebar interleaves with the holdings list),
+    falling back to flat-text extraction if that finds nothing on a given
+    page (some PDFs' font encoding makes word-level extraction behave
+    differently than character-level extraction)."""
     for page in pdf.pages:
         words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
         holdings = _holdings_from_words(words, debug_url=debug_url)
+        if holdings:
+            return holdings
+
+        text = page.extract_text() or ""
+        holdings = _holdings_from_text(text, debug_url=debug_url)
         if holdings:
             return holdings
     return []
