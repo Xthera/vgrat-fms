@@ -336,11 +336,37 @@ def find_factsheet_url(page) -> str:
     return ""
 
 
-def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> list:
+# The live fund page's "Fund facts" panel (risk/inception/CIC) has been
+# observed loading unreliably or not at all since Prudential's site
+# migration (verified live: "Loading fund details..." can persist
+# indefinitely). The static factsheet PDF - already being downloaded for
+# holdings - reliably contains the same information under a "Fund
+# Details" heading instead, verified against real factsheet text:
+#   "Fund Details Launch Date 21 October 2021 Risk Classification of
+#    Investment-linked Insurance Products (ILP) Medium to High Risk,
+#    Broadly Diversified ... Continuing Investment Charge 1.20% p.a."
+# These patterns are tolerant of the label/value being separated by
+# newlines OR by the middle-dot-style separators some extractions use.
+FACTSHEET_RISK_PATTERN = re.compile(
+    r"Risk Classification of\s+Investment-linked Insurance\s+Products \(ILP\)\s*"
+    r"(Lower Risk|Low to Medium Risk|Medium to High Risk|Higher Risk)",
+    re.I | re.S
+)
+FACTSHEET_LAUNCH_DATE_PATTERN = re.compile(
+    r"Launch Date\s+(\d{1,2} \w+ \d{4})", re.I
+)
+FACTSHEET_CIC_PATTERN = re.compile(
+    r"Continuing Investment Charge\s+([\d.]+)\s*%", re.I
+)
+
+
+def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> dict:
     """Downloads the factsheet PDF (plain HTTP - PDFs aren't subject to
-    the browser-JS-rendering concerns the main fund pages are) and hands
-    it to parse_holdings(), which reads each page's word positions
-    directly rather than a flattened text stream."""
+    the browser-JS-rendering concerns the main fund pages are) and
+    extracts both holdings (via word position) and the Fund Details
+    fields (risk/launch date/CIC) that the live page has proven
+    unreliable for. Returns {"holdings": [...], "risk": ..., "inception":
+    ..., "cic": ...} - any field not found is omitted, not guessed."""
     import requests
     import pdfplumber
     import io
@@ -348,8 +374,28 @@ def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> li
     resp = requests.get(factsheet_url, timeout=30)
     resp.raise_for_status()
 
+    result = {"holdings": []}
     with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-        return parse_holdings(pdf, debug_url=factsheet_url if debug else "")
+        result["holdings"] = parse_holdings(pdf, debug_url=factsheet_url if debug else "")
+
+        full_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        collapsed = re.sub(r"\s+", " ", full_text)
+
+        m = FACTSHEET_RISK_PATTERN.search(collapsed)
+        if m:
+            result["risk"] = m.group(1)
+        m = FACTSHEET_LAUNCH_DATE_PATTERN.search(collapsed)
+        if m:
+            result["inception"] = m.group(1)
+        m = FACTSHEET_CIC_PATTERN.search(collapsed)
+        if m:
+            result["cic"] = m.group(1)
+
+    if debug:
+        found = [k for k in ("risk", "inception", "cic") if k in result]
+        print(f"[debug] {factsheet_url}: factsheet fields found: {found or 'none'}", file=sys.stderr)
+
+    return result
 
 
 def parse_fund_page(text: str, url: str, debug: bool = False) -> dict:
@@ -444,12 +490,34 @@ def fetch_and_parse(url: str, debug: bool = False, capture_history: bool = False
             wait_until="networkidle",
             timeout=30000
         )
+
+        # The "Fund facts" panel (risk/currency/code/inception/CIC) loads
+        # via a slower, separate call than the rest of the page - verified
+        # live: a page snapshot taken right after networkidle can still
+        # show literal "Loading fund details..." placeholder text with
+        # that whole panel empty, even though Prices/chart have already
+        # rendered. Waiting for the actual heading text to appear (with a
+        # generous timeout, and NOT raising if it never shows up - some
+        # fund types may genuinely lack this panel) is more reliable than
+        # waiting on network activity alone.
+        try:
+            page.wait_for_selector("text=Risk classification", timeout=15000)
+        except Exception:
+            pass  # proceed anyway - parse_fund_page will just report it missing
+
         if capture_history:
             # give any lazily-triggered chart JS a little extra time
             page.wait_for_timeout(2000)
 
         text = page.inner_text("body")
         factsheet_url = find_factsheet_url(page)
+        if factsheet_url:
+            # Prudential's factsheet link can be a site-relative path
+            # (verified live: "/content/dam/.../some-fund.pdf" with no
+            # domain) - resolve it against the page's own URL so it's a
+            # real, fetchable absolute URL.
+            from urllib.parse import urljoin
+            factsheet_url = urljoin(page.url, factsheet_url)
 
         browser.close()
 
@@ -462,11 +530,25 @@ def fetch_and_parse(url: str, debug: bool = False, capture_history: bool = False
     result["holdings"] = []
     if factsheet_url:
         try:
-            result["holdings"] = fetch_holdings_from_factsheet(factsheet_url, debug=debug)
+            factsheet_data = fetch_holdings_from_factsheet(factsheet_url, debug=debug)
+            result["holdings"] = factsheet_data.get("holdings", [])
+            # Prefer the factsheet's values for these fields - the live
+            # page's equivalent panel has been observed not loading at
+            # all since Prudential's site migration, while the static
+            # factsheet PDF has proven reliable for the same information.
+            for key in ("risk", "inception", "cic"):
+                if factsheet_data.get(key):
+                    result[key] = factsheet_data[key]
         except Exception as e:
             if debug:
-                print(f"[debug] {url}: factsheet holdings extraction failed ({factsheet_url}): {e}",
+                print(f"[debug] {url}: factsheet extraction failed ({factsheet_url}): {e}",
                       file=sys.stderr)
+
+    # Currency isn't reliably labelled on either source anymore, but the
+    # fund's own name states it explicitly for non-default share classes
+    # (e.g. "... (USD) (Acc)") - everything else is SGD.
+    if not result.get("currency"):
+        result["currency"] = "USD" if "(USD)" in (result.get("scraped_name") or "") else "SGD"
 
     if capture_history:
         out_dir = Path("history_capture")
