@@ -301,23 +301,27 @@ def _holdings_from_text(text: str, debug_url: str = "") -> list:
 
 def parse_holdings(pdf, debug_url: str = "") -> list:
     """Tries each page of the factsheet (the holdings table is usually on
-    page 1, but this doesn't assume that) and returns the first page that
-    yields any holdings at all - preferring the position-based method
-    (more accurate when a sidebar interleaves with the holdings list),
-    falling back to flat-text extraction if that finds nothing on a given
-    page (some PDFs' font encoding makes word-level extraction behave
-    differently than character-level extraction)."""
+    page 1, but this doesn't assume that). For each page, tries BOTH the
+    position-based method (more accurate when a sidebar interleaves with
+    the holdings list) and the flat-text method (more accurate when a
+    PDF's font encoding makes word-level extraction behave differently
+    than character-level extraction) and keeps whichever found more
+    entries - verified live: on one real factsheet the position-based
+    method found only 2 of 4 real holdings while the text method found
+    all 4, so committing to the first non-empty result was silently
+    losing real data. Returns the best result across all pages."""
+    best: list = []
     for page in pdf.pages:
         words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
-        holdings = _holdings_from_words(words, debug_url=debug_url)
-        if holdings:
-            return holdings
+        positional = _holdings_from_words(words, debug_url=debug_url)
 
         text = page.extract_text() or ""
-        holdings = _holdings_from_text(text, debug_url=debug_url)
-        if holdings:
-            return holdings
-    return []
+        textual = _holdings_from_text(text, debug_url=debug_url)
+
+        page_best = positional if len(positional) >= len(textual) else textual
+        if len(page_best) > len(best):
+            best = page_best
+    return best
 
 
 def find_factsheet_url(page) -> str:
@@ -348,7 +352,7 @@ def find_factsheet_url(page) -> str:
 # These patterns are tolerant of the label/value being separated by
 # newlines OR by the middle-dot-style separators some extractions use.
 FACTSHEET_RISK_PATTERN = re.compile(
-    r"Risk Classification of\s+Investment-linked Insurance\s+Products \(ILP\)\s*"
+    r"Risk Classification[^.]{0,100}?"
     r"(Lower Risk|Low to Medium Risk|Medium to High Risk|Higher Risk)",
     re.I | re.S
 )
@@ -380,6 +384,19 @@ def fetch_holdings_from_factsheet(factsheet_url: str, debug: bool = False) -> di
 
         full_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
         collapsed = re.sub(r"\s+", " ", full_text)
+
+        if debug:
+            # Regex patterns for these fields have twice now been built
+            # from an approximated/reformatted version of the real text
+            # (a search-engine snippet) rather than the real pdfplumber
+            # output, and twice that mismatch caused a field to silently
+            # not match. Dumping the actual extracted text lets that be
+            # fixed from ground truth instead of another guess.
+            out_dir = Path("factsheet_text_dump")
+            out_dir.mkdir(exist_ok=True)
+            out_path = out_dir / (re.sub(r"[^a-z0-9]+", "_", factsheet_url.lower()).strip("_") + ".txt")
+            out_path.write_text(full_text)
+            print(f"[debug] {factsheet_url}: raw extracted text -> {out_path}", file=sys.stderr)
 
         m = FACTSHEET_RISK_PATTERN.search(collapsed)
         if m:
